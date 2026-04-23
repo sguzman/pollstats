@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -25,6 +26,7 @@ struct AppConfig {
     user_agent: Option<String>,
     download_concurrency: Option<usize>,
     http_retries: Option<u32>,
+    download_rate_limit_kbps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -569,6 +571,7 @@ async fn process_http_file(
     dataset_id: &str,
     url: &str,
     retries: u32,
+    rate_limit_bps: u64,
 ) -> Result<()> {
     let d = Dataset {
         source_id: source_id.to_string(),
@@ -707,6 +710,7 @@ async fn process_http_file(
         let tmp = path.with_extension("part");
         debug!(path = %path.display(), attempt, "writing download");
 
+        let started = Instant::now();
         match (async {
             let mut written: u64 = 0;
             let mut file = tokio::fs::File::create(&tmp)
@@ -718,6 +722,14 @@ async fn process_http_file(
                 let chunk = chunk.context("read http body chunk")?;
                 file.write_all(&chunk).await.context("write chunk")?;
                 written += chunk.len() as u64;
+                if rate_limit_bps > 0 {
+                    let expected_secs = written as f64 / rate_limit_bps as f64;
+                    let elapsed_secs = started.elapsed().as_secs_f64();
+                    if expected_secs > elapsed_secs {
+                        let sleep_s = expected_secs - elapsed_secs;
+                        tokio::time::sleep(std::time::Duration::from_secs_f64(sleep_s)).await;
+                    }
+                }
             }
             file.flush().await.ok();
             tokio::fs::rename(&tmp, &path)
@@ -793,6 +805,7 @@ async fn process_dataset(
     store_dir: &Path,
     d: &Dataset,
     retries: u32,
+    rate_limit_bps: u64,
 ) -> Result<()> {
     if d.kind == "http_page" {
         let mp = manifest_path(store_dir, d);
@@ -807,7 +820,7 @@ async fn process_dataset(
         write_manifest(&mp, &m)?;
         info!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, crawl_download = d.crawl_download, "page dataset");
 
-        if matches!(mode, Mode::Check) || !d.crawl_download {
+        if !d.crawl_download {
             return Ok(());
         }
 
@@ -835,11 +848,18 @@ async fn process_dataset(
 
                 info!(source_id = %d.source_id, dataset_id = %d.dataset_id, subtrees = ?subtrees, "dataverse crawl");
                 let mut any_failed = false;
+                let mut total_datasets: usize = 0;
+                let mut total_files: usize = 0;
                 for subtree in subtrees {
                     let pids = dataverse_list_datasets(client, &subtree).await?;
+                    total_datasets += pids.len();
                     info!(source_id = %d.source_id, dataset_id = %d.dataset_id, subtree = %subtree, datasets = pids.len(), "dataverse datasets");
                     for pid in pids {
                         let files = dataverse_list_files(client, &pid).await?;
+                        total_files += files.len();
+                        if matches!(mode, Mode::Check) {
+                            continue;
+                        }
                         for (fid, fname) in files {
                             let file_url = dataverse_download_file_url(fid).await;
                             let mut h = Sha256::new();
@@ -855,6 +875,7 @@ async fn process_dataset(
                                 &key_dataset_id,
                                 &file_url,
                                 retries,
+                                rate_limit_bps,
                             )
                             .await
                             {
@@ -873,12 +894,24 @@ async fn process_dataset(
                         }
                     }
                 }
+                info!(
+                    source_id = %d.source_id,
+                    dataset_id = %d.dataset_id,
+                    datasets = total_datasets,
+                    files = total_files,
+                    "dataverse summary"
+                );
                 if any_failed {
                     return Err(anyhow!("one or more dataverse downloads failed"));
                 }
                 Ok::<(), anyhow::Error>(())
             }
             _ => {
+                if matches!(mode, Mode::Check) {
+                    let links = crawl_links(client, &d.url, d.crawl_max_links, d.crawl_same_host_only).await?;
+                    info!(source_id = %d.source_id, dataset_id = %d.dataset_id, links = links.len(), strategy = ?d.crawl_strategy, "discovered links (check only)");
+                    return Ok(());
+                }
                 let links = crawl_links(client, &d.url, d.crawl_max_links, d.crawl_same_host_only).await?;
                 info!(source_id = %d.source_id, dataset_id = %d.dataset_id, links = links.len(), strategy = ?d.crawl_strategy, "discovered links");
                 let mut any_failed = false;
@@ -908,7 +941,7 @@ async fn process_dataset(
                     let url_hash = hex::encode(h.finalize());
                     let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
                     if let Err(e) =
-                        process_http_file(client, mode, store_dir, &d.source_id, &key_dataset_id, &link, retries).await
+                        process_http_file(client, mode, store_dir, &d.source_id, &key_dataset_id, &link, retries, rate_limit_bps).await
                     {
                         any_failed = true;
                         error!(source_id = %d.source_id, dataset_id = %d.dataset_id, link = %link, error = ?e, "link failed");
@@ -926,7 +959,17 @@ async fn process_dataset(
     if d.kind != "http_file" {
         return Err(anyhow!("unknown dataset type {} for {}/{}", d.kind, d.source_id, d.dataset_id));
     }
-    process_http_file(client, mode, store_dir, &d.source_id, &d.dataset_id, &d.url, retries).await
+    process_http_file(
+        client,
+        mode,
+        store_dir,
+        &d.source_id,
+        &d.dataset_id,
+        &d.url,
+        retries,
+        rate_limit_bps,
+    )
+    .await
 }
 
 async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
@@ -947,6 +990,10 @@ async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
         .context("build http client")?;
 
     let retries = cfg.http_retries.unwrap_or(3);
+    let rate_limit_bps = cfg
+        .download_rate_limit_kbps
+        .unwrap_or(500)
+        .saturating_mul(1024);
 
     let concurrency = cfg.download_concurrency.unwrap_or(1).max(1);
     info!(concurrency, mode = ?mode, "starting run");
@@ -961,7 +1008,7 @@ async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
         let store_dir = cfg.store_dir.clone();
         let key = format!("{}/{}", d.source_id, d.dataset_id);
         async move {
-            process_dataset(&client, mode, &store_dir, &d, retries)
+            process_dataset(&client, mode, &store_dir, &d, retries, rate_limit_bps)
                 .await
                 .with_context(|| format!("process {key}"))
         }

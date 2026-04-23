@@ -21,3 +21,6 @@ http_retries = 3
 # How aggressively to fetch datasets.
 # 1 = download each one at a time (default).
 download_concurrency = 1
+
+# Download rate limit (kilobytes per second) to improve robustness on flaky connections.
+download_rate_limit_kbps = 500
