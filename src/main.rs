@@ -38,6 +38,7 @@ struct AriaConfig {
     conf_filename: Option<String>,
     conf_template_file: Option<PathBuf>,
     emit: Option<BTreeMap<String, String>>,
+    audit_log_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1136,6 +1137,7 @@ fn write_aria_urls(
     urls_path: &Path,
     selections: &[String],
     sources_cfg: &SourcesConfig,
+    skip_urls: &BTreeMap<String, String>,
 ) -> Result<()> {
     if let Some(parent) = urls_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -1171,6 +1173,9 @@ fn write_aria_urls(
             .with_context(|| format!("read enumeration {}", enum_path.display()))?;
 
         for it in cache.items {
+            if skip_urls.contains_key(&it.url) {
+                continue;
+            }
             out.push_str(&it.url);
             out.push('\n');
             let dir_absish = PathBuf::from(&it.dir);
@@ -1399,16 +1404,41 @@ async fn process_http_file(
             // Some hosts stream without length; allow, but log because timeouts are more likely.
             debug!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, "no content-length");
         }
-        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+        let st = resp.status();
+        if st == reqwest::StatusCode::NOT_MODIFIED {
             info!(source_id = %d.source_id, dataset_id = %d.dataset_id, "304 not modified");
             return Ok(());
         }
-        if !resp.status().is_success() {
+        if st == reqwest::StatusCode::BAD_REQUEST
+            && d.url.starts_with("https://dataverse.harvard.edu/api/access/datafile/")
+        {
+            // Dataverse uses 400 for certain policy checks, notably "guestbook required".
+            // That's not something we can solve automatically; skip with a clear message so
+            // bulk runs keep going.
+            let body = resp.text().await.unwrap_or_default();
+            let lower = body.to_ascii_lowercase();
+            if lower.contains("guestbook") && lower.contains("response") {
+                warn!(
+                    source_id = %d.source_id,
+                    dataset_id = %d.dataset_id,
+                    url = %d.url,
+                    "dataverse guestbook required; skipping download"
+                );
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "dataverse access endpoint returned 400 for {}/{} (not guestbook): {}",
+                d.source_id,
+                d.dataset_id,
+                body.trim()
+            ));
+        }
+        if !st.is_success() {
             return Err(anyhow!(
                 "download not success for {}/{} (status {})",
                 d.source_id,
                 d.dataset_id,
-                resp.status()
+                st
             ));
         }
 
@@ -1858,8 +1888,83 @@ async fn cmd_aria_export(only: Vec<String>) -> Result<i32> {
         }
     }
 
+    let mut skip_urls: BTreeMap<String, String> = BTreeMap::new();
+    // Audit: omit Dataverse URLs that aria2 previously failed with status=400 due to a required
+    // guestbook response (not automatable without user-provided guestbook data).
+    #[derive(Debug, Clone, Serialize)]
+    struct BlockedAriaUrl {
+        url: String,
+        http_status: u16,
+        reason: String,
+    }
+
+    fn parse_aria2_log_for_400_uris(path: &Path) -> Result<Vec<String>> {
+        let txt = fs::read_to_string(path).with_context(|| format!("read aria2 log {}", path.display()))?;
+        let mut last_uri: Option<String> = None;
+        let mut out: Vec<String> = Vec::new();
+        for line in txt.lines() {
+            if let Some(idx) = line.find("Download aborted. URI=") {
+                let u = line[idx + "Download aborted. URI=".len()..].trim();
+                if !u.is_empty() {
+                    last_uri = Some(u.to_string());
+                }
+                continue;
+            }
+            if line.contains("status=400") {
+                if let Some(u) = last_uri.take() {
+                    out.push(u);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    let log_path = cfg
+        .aria
+        .as_ref()
+        .and_then(|a| a.audit_log_file.clone())
+        .unwrap_or_else(|| PathBuf::from("tmp/out1.log"));
+    if log_path.exists() {
+        let candidates = parse_aria2_log_for_400_uris(&log_path)?;
+        if !candidates.is_empty() {
+            info!(count = candidates.len(), path = %log_path.display(), "aria2 400 failures found; checking for guestbook requirement");
+        }
+        let mut blocked: Vec<BlockedAriaUrl> = Vec::new();
+        for u in candidates {
+            if !u.starts_with("https://dataverse.harvard.edu/api/access/datafile/") {
+                continue;
+            }
+            match client.get(&u).send().await {
+                Ok(resp) => {
+                    let st = resp.status();
+                    if st != reqwest::StatusCode::BAD_REQUEST {
+                        continue;
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+                    let lower = body.to_ascii_lowercase();
+                    if lower.contains("guestbook") && lower.contains("response") {
+                        skip_urls.insert(u.clone(), "dataverse guestbook required".to_string());
+                        blocked.push(BlockedAriaUrl {
+                            url: u,
+                            http_status: 400,
+                            reason: "dataverse guestbook required".to_string(),
+                        });
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if !blocked.is_empty() {
+            let blocked_path = cfg.store_dir.join("aria").join("blocked.json");
+            write_json_file(&blocked_path, &blocked)?;
+            warn!(count = blocked.len(), path = %blocked_path.display(), "some aria urls were blocked and omitted");
+        }
+    }
+
     let (urls_path, conf_path) = aria_output_paths(&cfg);
-    write_aria_urls(&cfg, &urls_path, &only, &sources_cfg)?;
+    write_aria_urls(&cfg, &urls_path, &only, &sources_cfg, &skip_urls)?;
     write_aria_conf(&cfg, &conf_path, &urls_path)?;
 
     info!(
@@ -1973,23 +2078,50 @@ async fn cmd_access_check(only: Vec<String>, bad_only: bool, good_only: bool) ->
                     if st == reqwest::StatusCode::PARTIAL_CONTENT || st.is_success() {
                         (true, st.as_u16(), "ok")
                     } else if st == reqwest::StatusCode::BAD_REQUEST {
-                        // Some servers (e.g. Dataverse) may not support Range and return 400.
-                        // Retry with HEAD to avoid a full download.
-                        match client.head(&it.url).headers(to_headermap(&headers)?).send().await {
-                            Ok(hr) => {
-                                let hs = hr.status();
-                                let is_dataverse_access = it.url.starts_with("https://dataverse.harvard.edu/api/access/datafile/");
-                                if hs.is_success()
-                                    || hs == reqwest::StatusCode::FORBIDDEN
-                                    || hs == reqwest::StatusCode::METHOD_NOT_ALLOWED
-                                    || (is_dataverse_access && hs == reqwest::StatusCode::BAD_REQUEST)
-                                {
-                                    (true, hs.as_u16(), "range unsupported; head ok")
-                                } else {
-                                    (false, hs.as_u16(), "range unsupported; head failed")
+                        let is_dataverse_access =
+                            it.url.starts_with("https://dataverse.harvard.edu/api/access/datafile/");
+                        if is_dataverse_access {
+                            // Distinguish "range unsupported" from "guestbook required".
+                            match client.get(&it.url).headers(to_headermap(&headers)?).send().await {
+                                Ok(rr) => {
+                                    let s2 = rr.status();
+                                    if s2.is_success() || s2 == reqwest::StatusCode::PARTIAL_CONTENT {
+                                        (true, s2.as_u16(), "range unsupported; get ok")
+                                    } else if s2 == reqwest::StatusCode::BAD_REQUEST {
+                                        let body = rr.text().await.unwrap_or_default();
+                                        let lower = body.to_ascii_lowercase();
+                                        if lower.contains("guestbook") && lower.contains("response") {
+                                            (false, 400, "guestbook required")
+                                        } else {
+                                            (false, 400, "bad request")
+                                        }
+                                    } else if s2 == reqwest::StatusCode::FORBIDDEN
+                                        || s2 == reqwest::StatusCode::UNAUTHORIZED
+                                    {
+                                        (false, s2.as_u16(), "auth/forbidden")
+                                    } else {
+                                        (false, s2.as_u16(), "http error")
+                                    }
                                 }
+                                Err(_) => (false, 400, "range unsupported; get error"),
                             }
-                            Err(_) => (false, 400, "range unsupported; head error"),
+                        } else {
+                            // Some servers may not support Range and return 400.
+                            // Retry with HEAD to avoid a full download.
+                            match client.head(&it.url).headers(to_headermap(&headers)?).send().await {
+                                Ok(hr) => {
+                                    let hs = hr.status();
+                                    if hs.is_success()
+                                        || hs == reqwest::StatusCode::FORBIDDEN
+                                        || hs == reqwest::StatusCode::METHOD_NOT_ALLOWED
+                                    {
+                                        (true, hs.as_u16(), "range unsupported; head ok")
+                                    } else {
+                                        (false, hs.as_u16(), "range unsupported; head failed")
+                                    }
+                                }
+                                Err(_) => (false, 400, "range unsupported; head error"),
+                            }
                         }
                     } else if st == reqwest::StatusCode::UNAUTHORIZED || st == reqwest::StatusCode::FORBIDDEN {
                         (false, st.as_u16(), "auth/forbidden")
