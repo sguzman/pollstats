@@ -14,6 +14,46 @@ homepage = "https://electionlab.mit.edu/"
   crawl_strategy = "dataverse"
   # Optional: explicit Dataverse subtrees to crawl. If omitted, we attempt to extract from the page HTML.
   dataverse_subtrees = ["medsl", "medsl_election_returns"]
+  # These Dataverse files require a guestbook response and will fail to download via automation.
+  # Omit them from aria-export by default.
+  exclude_dataverse_file_ids = [
+    4304791,
+    5767898,
+    5767899,
+    5767911,
+    5767912,
+    6081575,
+    6081576,
+    6081577,
+    6081578,
+    6081579,
+    6081582,
+    6081584,
+    6081585,
+    6081586,
+    6081588,
+    6081589,
+    6081590,
+    6081591,
+    6081593,
+    6081623,
+    6081624,
+    6081645,
+    6692667,
+    6692668,
+    6692669,
+    7241480,
+    9656259,
+    9656260,
+    9656261,
+    9656262,
+    9656263,
+    10244938,
+    13673743,
+    13673744,
+    13673745,
+    13673746,
+  ]
 
 [[sources]]
 id = "fec"
