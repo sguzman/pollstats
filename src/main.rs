@@ -591,6 +591,8 @@ async fn dataverse_download_file_url(datafile_id: i64) -> String {
 struct DataverseFilePlanItem {
     subtree: String,
     persistent_id: String,
+    dataset_title: Option<String>,
+    dataset_description: Option<String>,
     file_id: i64,
     filename: String,
     size_bytes: Option<u64>,
@@ -606,7 +608,6 @@ struct DataverseEnumerationCache {
     datasets: usize,
     files: usize,
     total_bytes: Option<u64>,
-    datasets_meta: BTreeMap<String, DataverseDatasetMeta>,
     items: Vec<DataverseFilePlanItem>,
 }
 
@@ -720,23 +721,20 @@ async fn ensure_dataverse_enumeration(
     let mut total_datasets: usize = 0;
     let mut total_bytes: u64 = 0;
     let mut any_size: bool = false;
-    let mut datasets_meta: BTreeMap<String, DataverseDatasetMeta> = BTreeMap::new();
     for subtree in &subtrees {
         let pids = dataverse_list_datasets(client, subtree).await?;
         total_datasets += pids.len();
         for pid in pids {
-            if !datasets_meta.contains_key(&pid) {
-                // Best-effort metadata; don't fail enumeration if a single dataset meta fetch fails.
-                match dataverse_get_dataset_meta(client, &pid).await {
-                    Ok(m) => {
-                        datasets_meta.insert(pid.clone(), m);
-                    }
-                    Err(e) => {
-                        warn!(persistent_id = %pid, error = ?e, "dataverse meta fetch failed");
-                        datasets_meta.insert(pid.clone(), DataverseDatasetMeta { title: None, description: None });
+            let meta = match dataverse_get_dataset_meta(client, &pid).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(persistent_id = %pid, error = ?e, "dataverse meta fetch failed");
+                    DataverseDatasetMeta {
+                        title: None,
+                        description: None,
                     }
                 }
-            }
+            };
             let files = dataverse_list_files(client, &pid).await?;
             for (fid, fname, size) in files {
                 let url = dataverse_download_file_url(fid).await;
@@ -747,6 +745,8 @@ async fn ensure_dataverse_enumeration(
                 items.push(DataverseFilePlanItem {
                     subtree: subtree.clone(),
                     persistent_id: pid.clone(),
+                    dataset_title: meta.title.clone(),
+                    dataset_description: meta.description.clone(),
                     file_id: fid,
                     filename: fname,
                     size_bytes: size,
@@ -764,7 +764,6 @@ async fn ensure_dataverse_enumeration(
         datasets: total_datasets,
         files: items.len(),
         total_bytes: if any_size { Some(total_bytes) } else { None },
-        datasets_meta,
         items,
     };
     write_json_file(&path, &cache)?;
