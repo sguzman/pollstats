@@ -96,6 +96,7 @@ struct Dataset {
     dataverse_subtrees: Vec<String>,
     headers: BTreeMap<String, String>,
     requires_cookie: bool,
+    cookie_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +169,27 @@ enum Command {
     },
     /// List configured sources/datasets
     List,
+    /// Enumerate dataset file URLs into cache (all sources)
+    Enumerate {
+        /// Restrict to `source_id/dataset_id` (repeatable)
+        #[arg(long)]
+        only: Vec<String>,
+        /// Overwrite any cached enumerations
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
+    },
+    /// Check whether enumerated URLs are accessible via automation (no full downloads)
+    AccessCheck {
+        /// Restrict to `source_id/dataset_id` (repeatable)
+        #[arg(long)]
+        only: Vec<String>,
+        /// Log only inaccessible links
+        #[arg(long, default_value_t = false)]
+        bad_links_only: bool,
+        /// Log only accessible links
+        #[arg(long, default_value_t = false)]
+        good_links_only: bool,
+    },
     /// Emit aria2 config + url list for cached enumerations
     AriaExport {
         /// Restrict to `source_id/dataset_id` (repeatable). Uses enumeration caches.
@@ -227,30 +249,13 @@ fn iter_datasets(sources_cfg: &SourcesConfig) -> Vec<Dataset> {
                 crawl_same_host_only: d.crawl_same_host_only.unwrap_or(true),
                 crawl_strategy: CrawlStrategy::from_opt(d.crawl_strategy.as_deref()),
                 dataverse_subtrees: d.dataverse_subtrees.clone().unwrap_or_default(),
-                headers: resolve_dataset_headers(d.headers.clone().unwrap_or_default(), d.cookie_file.as_deref()),
+                headers: d.headers.clone().unwrap_or_default(),
                 requires_cookie: d.cookie_file.is_some(),
+                cookie_file: d.cookie_file.as_deref().map(PathBuf::from),
             });
         }
     }
     out
-}
-
-fn resolve_dataset_headers(mut headers: BTreeMap<String, String>, cookie_file: Option<&str>) -> BTreeMap<String, String> {
-    if let Some(path) = cookie_file {
-        match read_cookiejar_for_domain(Path::new(path), "electionstudies.org") {
-            Ok(cookie_header) => {
-                if !cookie_header.trim().is_empty() {
-                    headers.insert("Cookie".to_string(), cookie_header);
-                } else {
-                    debug!(path, "cookie file had no usable cookies for electionstudies.org");
-                }
-            }
-            Err(e) => {
-                debug!(path, error = ?e, "failed to read cookie file");
-            }
-        }
-    }
-    headers
 }
 
 fn read_cookiejar_for_domain(path: &Path, domain: &str) -> Result<String> {
@@ -604,27 +609,30 @@ async fn dataverse_download_file_url(datafile_id: i64) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DataverseFilePlanItem {
-    subtree: String,
-    persistent_id: String,
-    dataset_title: Option<String>,
-    dataset_description: Option<String>,
-    file_id: i64,
-    filename: String,
-    size_bytes: Option<u64>,
-    url: String,
+struct EnumerationCache {
+    schema: String,
+    source_id: String,
+    dataset_id: String,
+    dataset_kind: String,
+    enumerated_at: String,
+    items: Vec<EnumerationItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DataverseEnumerationCache {
-    source_id: String,
-    dataset_id: String,
-    subtrees: Vec<String>,
-    enumerated_at: String,
-    datasets: usize,
-    files: usize,
-    total_bytes: Option<u64>,
-    items: Vec<DataverseFilePlanItem>,
+struct EnumerationItem {
+    url: String,
+    dir: String,
+    out: String,
+    headers: BTreeMap<String, String>,
+    cookie_file: Option<String>,
+
+    // Optional metadata (best-effort)
+    size_bytes: Option<u64>,
+    dataset_title: Option<String>,
+    dataset_description: Option<String>,
+    persistent_id: Option<String>,
+    file_id: Option<i64>,
+    subtree: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -703,83 +711,153 @@ async fn dataverse_get_dataset_meta(client: &reqwest::Client, persistent_id: &st
     Ok(DataverseDatasetMeta { title, description })
 }
 
-async fn ensure_dataverse_enumeration(
+async fn ensure_enumeration(
     client: &reqwest::Client,
     store_dir: &Path,
     d: &Dataset,
     refresh: bool,
-) -> Result<DataverseEnumerationCache> {
+) -> Result<EnumerationCache> {
     let path = enumeration_path(store_dir, d);
     if !refresh && path.exists() {
         return read_json_file(&path);
     }
 
     let enumerated_at = now_iso()?;
-    let mut subtrees = d.dataverse_subtrees.clone();
-    if subtrees.is_empty() {
-        let resp = client.get(&d.url).send().await.with_context(|| format!("get page {}", d.url))?;
-        let body = resp.text().await.context("read page body")?;
-        let re = Regex::new(r#"https://dataverse\.harvard\.edu/dataverse/([A-Za-z0-9_-]+)"#).expect("dv re");
-        for cap in re.captures_iter(&body) {
-            if let Some(m) = cap.get(1) {
-                subtrees.push(m.as_str().to_string());
+    let mut items: Vec<EnumerationItem> = Vec::new();
+
+    if d.kind == "http_file" {
+        let out_name = url::Url::parse(&d.url)
+            .ok()
+            .and_then(|u| u.path_segments().and_then(|mut it| it.next_back()).map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "download.bin".to_string());
+        let dir = latest_dir(store_dir, d).to_string_lossy().to_string();
+        items.push(EnumerationItem {
+            url: d.url.clone(),
+            dir,
+            out: sanitize_aria_filename(&out_name),
+            headers: d.headers.clone(),
+            cookie_file: d.cookie_file.as_ref().map(|p| p.to_string_lossy().to_string()),
+            size_bytes: None,
+            dataset_title: Some(d.dataset_name.clone()),
+            dataset_description: None,
+            persistent_id: None,
+            file_id: None,
+            subtree: None,
+        });
+    } else if d.kind == "http_page" && d.crawl_strategy == CrawlStrategy::Dataverse && d.crawl_download {
+        let mut subtrees = d.dataverse_subtrees.clone();
+        if subtrees.is_empty() {
+            let resp = client.get(&d.url).send().await.with_context(|| format!("get page {}", d.url))?;
+            let body = resp.text().await.context("read page body")?;
+            let re = Regex::new(r#"https://dataverse\.harvard\.edu/dataverse/([A-Za-z0-9_-]+)"#).expect("dv re");
+            for cap in re.captures_iter(&body) {
+                if let Some(m) = cap.get(1) {
+                    subtrees.push(m.as_str().to_string());
+                }
             }
+            subtrees.sort();
+            subtrees.dedup();
         }
-        subtrees.sort();
-        subtrees.dedup();
-    }
+        if subtrees.is_empty() {
+            return Err(anyhow!("no dataverse subtrees configured/found"));
+        }
 
-    if subtrees.is_empty() {
-        return Err(anyhow!("no dataverse subtrees configured/found"));
-    }
-
-    let mut items: Vec<DataverseFilePlanItem> = Vec::new();
-    let mut total_datasets: usize = 0;
-    let mut total_bytes: u64 = 0;
-    let mut any_size: bool = false;
-    for subtree in &subtrees {
-        let pids = dataverse_list_datasets(client, subtree).await?;
-        total_datasets += pids.len();
-        for pid in pids {
-            let meta = match dataverse_get_dataset_meta(client, &pid).await {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(persistent_id = %pid, error = ?e, "dataverse meta fetch failed");
-                    DataverseDatasetMeta {
-                        title: None,
-                        description: None,
+        for subtree in &subtrees {
+            let pids = dataverse_list_datasets(client, subtree).await?;
+            for pid in pids {
+                let meta = match dataverse_get_dataset_meta(client, &pid).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(persistent_id = %pid, error = ?e, "dataverse meta fetch failed");
+                        DataverseDatasetMeta { title: None, description: None }
                     }
+                };
+                let files = dataverse_list_files(client, &pid).await?;
+                for (fid, fname, size) in files {
+                    let file_url = dataverse_download_file_url(fid).await;
+                    let hashed_id = compute_hashed_dataset_id(&d.dataset_id, &file_url);
+                    let dir = store_dir
+                        .join("raw")
+                        .join(&d.source_id)
+                        .join(&hashed_id)
+                        .join("latest")
+                        .to_string_lossy()
+                        .to_string();
+                    items.push(EnumerationItem {
+                        url: file_url,
+                        dir,
+                        out: sanitize_aria_filename(&fname),
+                        headers: BTreeMap::new(),
+                        cookie_file: None,
+                        size_bytes: size,
+                        dataset_title: meta.title.clone(),
+                        dataset_description: meta.description.clone(),
+                        persistent_id: Some(pid.clone()),
+                        file_id: Some(fid),
+                        subtree: Some(subtree.clone()),
+                    });
                 }
-            };
-            let files = dataverse_list_files(client, &pid).await?;
-            for (fid, fname, size) in files {
-                let url = dataverse_download_file_url(fid).await;
-                if let Some(sz) = size {
-                    total_bytes = total_bytes.saturating_add(sz);
-                    any_size = true;
-                }
-                items.push(DataverseFilePlanItem {
-                    subtree: subtree.clone(),
-                    persistent_id: pid.clone(),
-                    dataset_title: meta.title.clone(),
-                    dataset_description: meta.description.clone(),
-                    file_id: fid,
-                    filename: fname,
-                    size_bytes: size,
-                    url,
-                });
             }
         }
+    } else if d.kind == "http_page" && d.crawl_download && !matches!(d.crawl_strategy, CrawlStrategy::Dataverse) {
+        let links = crawl_links(client, &d.url, d.crawl_max_links, d.crawl_same_host_only).await?;
+        for link in links {
+            if d.crawl_strategy == CrawlStrategy::ExtensionsOnly {
+                if let Ok(u) = url::Url::parse(&link) {
+                    if !is_downloadable_link(&u) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else if d.crawl_strategy == CrawlStrategy::HeadProbe {
+                match client.head(&link).send().await {
+                    Ok(r) => {
+                        if !r.status().is_success() || !head_says_downloadable(r.headers()) {
+                            continue;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+            let out_name = url::Url::parse(&link)
+                .ok()
+                .and_then(|u| u.path_segments().and_then(|mut it| it.next_back()).map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "download.bin".to_string());
+            let hashed_id = compute_hashed_dataset_id(&d.dataset_id, &link);
+            let dir = store_dir
+                .join("raw")
+                .join(&d.source_id)
+                .join(&hashed_id)
+                .join("latest")
+                .to_string_lossy()
+                .to_string();
+            items.push(EnumerationItem {
+                url: link,
+                dir,
+                out: sanitize_aria_filename(&out_name),
+                headers: BTreeMap::new(),
+                cookie_file: None,
+                size_bytes: None,
+                dataset_title: Some(d.dataset_name.clone()),
+                dataset_description: None,
+                persistent_id: None,
+                file_id: None,
+                subtree: None,
+            });
+        }
+    } else {
+        // Not enumeratable without special handling or disabled crawling.
     }
 
-    let cache = DataverseEnumerationCache {
+    let cache = EnumerationCache {
+        schema: "pollstats.enumeration.v1".to_string(),
         source_id: d.source_id.clone(),
         dataset_id: d.dataset_id.clone(),
-        subtrees,
+        dataset_kind: d.kind.clone(),
         enumerated_at,
-        datasets: total_datasets,
-        files: items.len(),
-        total_bytes: if any_size { Some(total_bytes) } else { None },
         items,
     };
     write_json_file(&path, &cache)?;
@@ -1004,33 +1082,27 @@ fn write_aria_urls(
             continue;
         }
 
-        // Currently we only emit from the Dataverse enumeration schema.
-        let cache: DataverseEnumerationCache = read_json_file(&enum_path)
+        let cache: EnumerationCache = read_json_file(&enum_path)
             .with_context(|| format!("read enumeration {}", enum_path.display()))?;
 
-        // Headers for aria (from dataset config), if any.
-        let mut header_lines: Vec<String> = Vec::new();
-        for (k, v) in d.headers.iter() {
-            header_lines.push(format!("header={}: {}", k, v));
-        }
-
         for it in cache.items {
-            let hashed_dataset_id = compute_hashed_dataset_id(&d.dataset_id, &it.url);
-            let dir = store_dir
-                .join("raw")
-                .join(&d.source_id)
-                .join(&hashed_dataset_id)
-                .join("latest");
-            let out_name = sanitize_aria_filename(&it.filename);
-
             out.push_str(&it.url);
             out.push('\n');
-            out.push_str(&format!("  dir={}\n", dir.to_string_lossy()));
-            out.push_str(&format!("  out={}\n", out_name));
-            for hl in &header_lines {
-                out.push_str("  ");
-                out.push_str(hl);
-                out.push('\n');
+            out.push_str(&format!("  dir={}\n", it.dir));
+            out.push_str(&format!("  out={}\n", it.out));
+
+            // Headers from enumeration (non-secret).
+            for (k, v) in it.headers.iter() {
+                out.push_str(&format!("  header={}: {}\n", k, v));
+            }
+
+            // Cookies: if configured, derive Cookie header from cookie_file at export time.
+            if let Some(cookie_path) = it.cookie_file.as_deref() {
+                if let Ok(cookie) = read_cookiejar_for_domain(Path::new(cookie_path), "electionstudies.org") {
+                    if !cookie.trim().is_empty() {
+                        out.push_str(&format!("  header=Cookie: {}\n", cookie));
+                    }
+                }
             }
             out.push('\n');
         }
@@ -1056,6 +1128,7 @@ async fn process_http_file(
     retries: u32,
     rate_limit_bps: u64,
     extra_headers: &BTreeMap<String, String>,
+    cookie_file: Option<&Path>,
 ) -> Result<()> {
     let d = Dataset {
         source_id: source_id.to_string(),
@@ -1071,6 +1144,7 @@ async fn process_http_file(
         dataverse_subtrees: Vec::new(),
         headers: extra_headers.clone(),
         requires_cookie: false,
+        cookie_file: cookie_file.map(|p| p.to_path_buf()),
     };
 
     let mp = manifest_path(store_dir, &d);
@@ -1084,7 +1158,15 @@ async fn process_http_file(
 
     // Some hosts (notably Dataverse access endpoints) return 403 to HEAD. Treat that as "unknown",
     // and fall back to downloading (GET), which may still succeed.
-    let extra = to_headermap(&d.headers)?;
+    let mut extra_headers_map = d.headers.clone();
+    if let Some(cf) = d.cookie_file.as_deref() {
+        if let Ok(cookie) = read_cookiejar_for_domain(cf, "electionstudies.org") {
+            if !cookie.trim().is_empty() {
+                extra_headers_map.insert("Cookie".to_string(), cookie);
+            }
+        }
+    }
+    let extra = to_headermap(&extra_headers_map)?;
     match client.head(&d.url).headers(extra.clone()).send().await {
         Ok(head) => {
             let status = head.status();
@@ -1197,7 +1279,7 @@ async fn process_http_file(
             }
         }
     }
-    // Merge in extra headers (e.g. Cookie) last so they win.
+    // Merge in extra headers (including Cookie) last so they win.
     for (k, v) in extra.iter() {
         headers.insert(k, v.clone());
     }
@@ -1366,16 +1448,13 @@ async fn process_dataset(
         match d.crawl_strategy {
             CrawlStrategy::Dataverse => {
                 let refresh = matches!(mode, Mode::Check) && check_refresh;
-                let cache = ensure_dataverse_enumeration(client, store_dir, d, refresh).await?;
+                let cache = ensure_enumeration(client, store_dir, d, refresh).await?;
                 info!(
                     source_id = %d.source_id,
                     dataset_id = %d.dataset_id,
                     enumerated_at = %cache.enumerated_at,
-                    datasets = cache.datasets,
-                    files = cache.files,
-                    total_bytes = cache.total_bytes.unwrap_or(0),
-                    subtrees = ?cache.subtrees,
-                    "dataverse enumeration"
+                    files = cache.items.len(),
+                    "enumeration"
                 );
 
                 if matches!(mode, Mode::Check) {
@@ -1384,10 +1463,7 @@ async fn process_dataset(
 
                 let mut any_failed = false;
                 for it in cache.items {
-                    let mut h = Sha256::new();
-                    h.update(it.url.as_bytes());
-                    let url_hash = hex::encode(h.finalize());
-                    let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
+                    let key_dataset_id = compute_hashed_dataset_id(&d.dataset_id, &it.url);
                     if let Err(e) = process_http_file(
                         client,
                         mode,
@@ -1398,6 +1474,7 @@ async fn process_dataset(
                         retries,
                         rate_limit_bps,
                         &BTreeMap::new(),
+                        None,
                     )
                     .await
                     {
@@ -1405,19 +1482,18 @@ async fn process_dataset(
                         error!(
                             source_id = %d.source_id,
                             dataset_id = %d.dataset_id,
-                            subtree = %it.subtree,
-                            persistent_id = %it.persistent_id,
-                            file_id = it.file_id,
-                            filename = %it.filename,
+                            persistent_id = %it.persistent_id.as_deref().unwrap_or(""),
+                            file_id = it.file_id.unwrap_or(0),
+                            filename = %it.out,
                             size_bytes = it.size_bytes.unwrap_or(0),
                             url = %it.url,
                             error = ?e,
-                            "dataverse file failed"
+                            "enumerated file failed"
                         );
                     }
                 }
                 if any_failed {
-                    return Err(anyhow!("one or more dataverse downloads failed"));
+                    return Err(anyhow!("one or more enumerated downloads failed"));
                 }
                 Ok::<(), anyhow::Error>(())
             }
@@ -1456,7 +1532,7 @@ async fn process_dataset(
                     let url_hash = hex::encode(h.finalize());
                     let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
                     if let Err(e) =
-                        process_http_file(client, mode, store_dir, &d.source_id, &key_dataset_id, &link, retries, rate_limit_bps, &BTreeMap::new()).await
+                        process_http_file(client, mode, store_dir, &d.source_id, &key_dataset_id, &link, retries, rate_limit_bps, &BTreeMap::new(), None).await
                     {
                         any_failed = true;
                         error!(source_id = %d.source_id, dataset_id = %d.dataset_id, link = %link, error = ?e, "link failed");
@@ -1474,12 +1550,22 @@ async fn process_dataset(
     if d.kind != "http_file" {
         return Err(anyhow!("unknown dataset type {} for {}/{}", d.kind, d.source_id, d.dataset_id));
     }
-    if d.requires_cookie && !d.headers.contains_key("Cookie") {
-        return Err(anyhow!(
-            "cookie required but missing/invalid for {}/{}; refusing to attempt this domain",
-            d.source_id,
-            d.dataset_id
-        ));
+    if d.requires_cookie {
+        let Some(cf) = d.cookie_file.as_deref() else {
+            return Err(anyhow!(
+                "cookie required but cookie_file missing for {}/{}; refusing to attempt this domain",
+                d.source_id,
+                d.dataset_id
+            ));
+        };
+        let cookie = read_cookiejar_for_domain(cf, "electionstudies.org")?;
+        if cookie.trim().is_empty() {
+            return Err(anyhow!(
+                "cookie required but missing/invalid for {}/{}; refusing to attempt this domain",
+                d.source_id,
+                d.dataset_id
+            ));
+        }
     }
     process_http_file(
         client,
@@ -1491,6 +1577,7 @@ async fn process_dataset(
         retries,
         rate_limit_bps,
         &d.headers,
+        d.cookie_file.as_deref(),
     )
     .await
 }
@@ -1668,7 +1755,7 @@ async fn cmd_aria_export(only: Vec<String>) -> Result<i32> {
         .build()
         .context("build http client")?;
 
-    // Ensure enumerations exist for selected Dataverse datasets.
+    // Ensure enumerations exist for selected datasets (as needed).
     for d in iter_datasets(&sources_cfg) {
         if !only.is_empty() {
             let key = format!("{}/{}", d.source_id, d.dataset_id);
@@ -1676,10 +1763,10 @@ async fn cmd_aria_export(only: Vec<String>) -> Result<i32> {
                 continue;
             }
         }
-        if d.kind == "http_page" && d.crawl_strategy == CrawlStrategy::Dataverse && d.crawl_download {
+        if d.kind == "http_page" && d.crawl_download {
             let enum_path = enumeration_path(&cfg.store_dir, &d);
             if !enum_path.exists() {
-                let _ = ensure_dataverse_enumeration(&client, &cfg.store_dir, &d, false).await?;
+                let _ = ensure_enumeration(&client, &cfg.store_dir, &d, false).await?;
             }
         }
     }
@@ -1693,6 +1780,168 @@ async fn cmd_aria_export(only: Vec<String>) -> Result<i32> {
         conf = %conf_path.display(),
         "aria export written"
     );
+    Ok(0)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AllEnumerations {
+    schema: String,
+    generated_at: String,
+    datasets: Vec<EnumerationCache>,
+}
+
+async fn cmd_enumerate(only: Vec<String>, refresh: bool) -> Result<i32> {
+    let (cfg, sources_cfg) = load_config()?;
+
+    let timeout_s = cfg.http_timeout_seconds.unwrap_or(60);
+    let user_agent = cfg
+        .user_agent
+        .clone()
+        .unwrap_or_else(|| "pollstats/0.1 (+local)".to_string());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_s))
+        .user_agent(user_agent)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .context("build http client")?;
+
+    let mut datasets: Vec<EnumerationCache> = Vec::new();
+    for d in iter_datasets(&sources_cfg) {
+        if !only.is_empty() {
+            let key = format!("{}/{}", d.source_id, d.dataset_id);
+            if !only.iter().any(|x| x == &key) {
+                continue;
+            }
+        }
+        // Enumerate all datasets; for disabled pages, this will likely yield 0 items.
+        let cache = ensure_enumeration(&client, &cfg.store_dir, &d, refresh).await?;
+        info!(
+            source_id = %cache.source_id,
+            dataset_id = %cache.dataset_id,
+            items = cache.items.len(),
+            "enumerated"
+        );
+        datasets.push(cache);
+    }
+
+    let all = AllEnumerations {
+        schema: "pollstats.enumerations.v1".to_string(),
+        generated_at: now_iso()?,
+        datasets,
+    };
+    let all_path = cfg
+        .store_dir
+        .join("enumerations")
+        .join("all.json");
+    write_json_file(&all_path, &all)?;
+    info!(path = %all_path.display(), "enumerations written");
+    Ok(0)
+}
+
+async fn cmd_access_check(only: Vec<String>, bad_only: bool, good_only: bool) -> Result<i32> {
+    if bad_only && good_only {
+        return Err(anyhow!("--bad-links-only and --good-links-only are mutually exclusive"));
+    }
+    let (cfg, sources_cfg) = load_config()?;
+
+    let timeout_s = cfg.http_timeout_seconds.unwrap_or(60);
+    let user_agent = cfg
+        .user_agent
+        .clone()
+        .unwrap_or_else(|| "pollstats/0.1 (+local)".to_string());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_s))
+        .user_agent(user_agent)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .context("build http client")?;
+
+    for d in iter_datasets(&sources_cfg) {
+        if !only.is_empty() {
+            let key = format!("{}/{}", d.source_id, d.dataset_id);
+            if !only.iter().any(|x| x == &key) {
+                continue;
+            }
+        }
+        let cache = ensure_enumeration(&client, &cfg.store_dir, &d, false).await?;
+        for it in cache.items {
+            let mut headers = it.headers.clone();
+            if let Some(cookie_path) = it.cookie_file.as_deref() {
+                if let Ok(cookie) = read_cookiejar_for_domain(Path::new(cookie_path), "electionstudies.org") {
+                    if !cookie.trim().is_empty() {
+                        headers.insert("Cookie".to_string(), cookie);
+                    }
+                }
+            }
+            let mut hm = to_headermap(&headers)?;
+            hm.insert(
+                reqwest::header::RANGE,
+                HeaderValue::from_static("bytes=0-0"),
+            );
+
+            let res = client.get(&it.url).headers(hm.clone()).send().await;
+            let (ok, status, reason) = match res {
+                Ok(r) => {
+                    let st = r.status();
+                    if st == reqwest::StatusCode::PARTIAL_CONTENT || st.is_success() {
+                        (true, st.as_u16(), "ok")
+                    } else if st == reqwest::StatusCode::BAD_REQUEST {
+                        // Some servers (e.g. Dataverse) may not support Range and return 400.
+                        // Retry with HEAD to avoid a full download.
+                        match client.head(&it.url).headers(to_headermap(&headers)?).send().await {
+                            Ok(hr) => {
+                                let hs = hr.status();
+                                let is_dataverse_access = it.url.starts_with("https://dataverse.harvard.edu/api/access/datafile/");
+                                if hs.is_success()
+                                    || hs == reqwest::StatusCode::FORBIDDEN
+                                    || hs == reqwest::StatusCode::METHOD_NOT_ALLOWED
+                                    || (is_dataverse_access && hs == reqwest::StatusCode::BAD_REQUEST)
+                                {
+                                    (true, hs.as_u16(), "range unsupported; head ok")
+                                } else {
+                                    (false, hs.as_u16(), "range unsupported; head failed")
+                                }
+                            }
+                            Err(_) => (false, 400, "range unsupported; head error"),
+                        }
+                    } else if st == reqwest::StatusCode::UNAUTHORIZED || st == reqwest::StatusCode::FORBIDDEN {
+                        (false, st.as_u16(), "auth/forbidden")
+                    } else if st == reqwest::StatusCode::NOT_FOUND {
+                        (false, st.as_u16(), "not found")
+                    } else {
+                        (false, st.as_u16(), "http error")
+                    }
+                }
+                Err(e) => (false, 0, if e.is_timeout() { "timeout" } else { "network error" }),
+            };
+
+            if ok && bad_only {
+                continue;
+            }
+            if !ok && good_only {
+                continue;
+            }
+
+            if ok {
+                info!(
+                    source_id = %d.source_id,
+                    dataset_id = %d.dataset_id,
+                    url = %it.url,
+                    status = status,
+                    "accessible"
+                );
+            } else {
+                warn!(
+                    source_id = %d.source_id,
+                    dataset_id = %d.dataset_id,
+                    url = %it.url,
+                    status = status,
+                    reason = reason,
+                    "inaccessible"
+                );
+            }
+        }
+    }
     Ok(0)
 }
 
@@ -1715,6 +1964,10 @@ async fn main() -> Result<()> {
         Command::Check { only } => run_http(Mode::Check, only, true).await?,
         Command::Update { only } => run_http(Mode::UpdateIfNewer, only, false).await?,
         Command::Download { only } => run_http(Mode::DownloadAlways, only, false).await?,
+        Command::Enumerate { only, refresh } => cmd_enumerate(only, refresh).await?,
+        Command::AccessCheck { only, bad_links_only, good_links_only } => {
+            cmd_access_check(only, bad_links_only, good_links_only).await?
+        }
         Command::AriaExport { only } => cmd_aria_export(only).await?,
         Command::PgInit => cmd_pg_init().await?,
         Command::PgLoad { only } => cmd_pg_load(only).await?,
