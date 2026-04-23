@@ -11,7 +11,9 @@ homepage = "https://electionlab.mit.edu/"
   crawl_download = true
   crawl_max_links = 200
   crawl_same_host_only = false
-  crawl_strategy = "head"
+  crawl_strategy = "dataverse"
+  # Optional: explicit Dataverse subtrees to crawl. If omitted, we attempt to extract from the page HTML.
+  dataverse_subtrees = ["medsl_hosted", "medsl_grants"]
 
 [[sources]]
 id = "fec"

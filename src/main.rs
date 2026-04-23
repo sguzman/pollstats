@@ -62,6 +62,7 @@ struct DatasetConfig {
     crawl_max_links: Option<usize>,
     crawl_same_host_only: Option<bool>,
     crawl_strategy: Option<String>,
+    dataverse_subtrees: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,18 +78,21 @@ struct Dataset {
     crawl_max_links: usize,
     crawl_same_host_only: bool,
     crawl_strategy: CrawlStrategy,
+    dataverse_subtrees: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CrawlStrategy {
     ExtensionsOnly,
     HeadProbe,
+    Dataverse,
 }
 
 impl CrawlStrategy {
     fn from_opt(s: Option<&str>) -> Self {
         match s.unwrap_or("extensions").to_ascii_lowercase().as_str() {
             "head" | "headprobe" | "probe" => Self::HeadProbe,
+            "dataverse" => Self::Dataverse,
             _ => Self::ExtensionsOnly,
         }
     }
@@ -199,6 +203,7 @@ fn iter_datasets(sources_cfg: &SourcesConfig) -> Vec<Dataset> {
                 crawl_max_links: d.crawl_max_links.unwrap_or(200),
                 crawl_same_host_only: d.crawl_same_host_only.unwrap_or(true),
                 crawl_strategy: CrawlStrategy::from_opt(d.crawl_strategy.as_deref()),
+                dataverse_subtrees: d.dataverse_subtrees.clone().unwrap_or_default(),
             });
         }
     }
@@ -349,6 +354,112 @@ fn head_says_downloadable(headers: &HeaderMap) -> bool {
     false
 }
 
+#[derive(Debug, Deserialize)]
+struct DataverseSearchResp {
+    data: DataverseSearchData,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataverseSearchData {
+    items: Vec<DataverseSearchItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataverseSearchItem {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "global_id")]
+    global_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataverseDatasetResp {
+    data: DataverseDatasetData,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataverseDatasetData {
+    #[serde(rename = "latestVersion")]
+    latest_version: DataverseDatasetVersion,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataverseDatasetVersion {
+    files: Vec<DataverseDatasetFileWrapper>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataverseDatasetFileWrapper {
+    #[serde(rename = "dataFile")]
+    data_file: DataverseDataFile,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataverseDataFile {
+    id: i64,
+    filename: String,
+}
+
+async fn dataverse_list_datasets(client: &reqwest::Client, subtree: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut start: u32 = 0;
+    let per_page: u32 = 100;
+    loop {
+        let url = format!(
+            "https://dataverse.harvard.edu/api/search?q=*&type=dataset&subtree={}&per_page={}&start={}",
+            urlencoding::encode(subtree),
+            per_page,
+            start
+        );
+        let r = client.get(&url).send().await.with_context(|| format!("dataverse search {subtree}"))?;
+        if !r.status().is_success() {
+            return Err(anyhow!("dataverse search failed {subtree} status {}", r.status()));
+        }
+        let resp: DataverseSearchResp = r.json().await.context("parse dataverse search json")?;
+        let mut added = 0usize;
+        for it in resp.data.items {
+            if it.kind != "dataset" {
+                continue;
+            }
+            if let Some(gid) = it.global_id {
+                out.push(gid);
+                added += 1;
+            }
+        }
+        if added == 0 {
+            break;
+        }
+        start += per_page;
+        if start > 10_000 {
+            break;
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+async fn dataverse_list_files(client: &reqwest::Client, persistent_id: &str) -> Result<Vec<(i64, String)>> {
+    let url = format!(
+        "https://dataverse.harvard.edu/api/datasets/:persistentId/?persistentId={}",
+        urlencoding::encode(persistent_id)
+    );
+    let r = client.get(&url).send().await.with_context(|| format!("dataverse dataset {persistent_id}"))?;
+    if !r.status().is_success() {
+        return Err(anyhow!("dataverse dataset fetch failed {persistent_id} status {}", r.status()));
+    }
+    let resp: DataverseDatasetResp = r.json().await.context("parse dataverse dataset json")?;
+    let mut out = Vec::new();
+    for f in resp.data.latest_version.files {
+        out.push((f.data_file.id, f.data_file.filename));
+    }
+    Ok(out)
+}
+
+async fn dataverse_download_file_url(datafile_id: i64) -> String {
+    format!("https://dataverse.harvard.edu/api/access/datafile/{datafile_id}")
+}
+
 async fn crawl_links(
     client: &reqwest::Client,
     base_url: &str,
@@ -470,43 +581,57 @@ async fn process_http_file(
         crawl_max_links: 0,
         crawl_same_host_only: false,
         crawl_strategy: CrawlStrategy::ExtensionsOnly,
+        dataverse_subtrees: Vec::new(),
     };
 
     let mp = manifest_path(store_dir, &d);
     let mut m = load_manifest(&mp)?;
     let now = now_iso()?;
 
-    let head = client
-        .head(&d.url)
-        .send()
-        .await
-        .with_context(|| format!("head {}", d.url))?;
-    let status = head.status();
-    if !status.is_success() {
-        warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, http_status = %status, "head not success");
+    let mut etag: Option<String> = None;
+    let mut last_modified: Option<String> = None;
+    let mut content_length: Option<String> = None;
+    let mut remote_newer = true;
+
+    // Some hosts (notably Dataverse access endpoints) return 403 to HEAD. Treat that as "unknown",
+    // and fall back to downloading (GET), which may still succeed.
+    match client.head(&d.url).send().await {
+        Ok(head) => {
+            let status = head.status();
+            if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+                warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, http_status = %status, "head not allowed; will download");
+            } else {
+                if !status.is_success() {
+                    warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, http_status = %status, "head not success");
+                }
+
+                etag = head
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                last_modified = head
+                    .headers()
+                    .get(reqwest::header::LAST_MODIFIED)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                content_length = head
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+
+                remote_newer = match (&m.etag, &etag, &m.last_modified, &last_modified) {
+                    (Some(a), Some(b), _, _) if a == b => false,
+                    (_, _, Some(a), Some(b)) if a == b => false,
+                    _ => true,
+                };
+            }
+        }
+        Err(e) => {
+            warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, error = ?e, "head failed; will download");
+        }
     }
-
-    let etag = head
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let last_modified = head
-        .headers()
-        .get(reqwest::header::LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let content_length = head
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let remote_newer = match (&m.etag, &etag, &m.last_modified, &last_modified) {
-        (Some(a), Some(b), _, _) if a == b => false,
-        (_, _, Some(a), Some(b)) if a == b => false,
-        _ => true,
-    };
 
     match mode {
         Mode::Check => {
@@ -680,44 +805,115 @@ async fn process_dataset(
             return Ok(());
         }
 
-        let links = crawl_links(client, &d.url, d.crawl_max_links, d.crawl_same_host_only).await?;
-        info!(source_id = %d.source_id, dataset_id = %d.dataset_id, links = links.len(), strategy = ?d.crawl_strategy, "discovered links");
-        let mut any_failed = false;
-        for link in links {
-            // Strategy: either only download links with known extensions, or probe with HEAD.
-            if d.crawl_strategy == CrawlStrategy::ExtensionsOnly {
-                if let Ok(u) = url::Url::parse(&link) {
-                    if !is_downloadable_link(&u) {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            } else if d.crawl_strategy == CrawlStrategy::HeadProbe {
-                match client.head(&link).send().await {
-                    Ok(r) => {
-                        if !r.status().is_success() || !head_says_downloadable(r.headers()) {
-                            continue;
+        match d.crawl_strategy {
+            CrawlStrategy::Dataverse => {
+                let mut subtrees = d.dataverse_subtrees.clone();
+                if subtrees.is_empty() {
+                    // Try to extract dataverse aliases from the page itself.
+                    let resp = client.get(&d.url).send().await.with_context(|| format!("get page {}", d.url))?;
+                    let body = resp.text().await.context("read page body")?;
+                    let re = Regex::new(r#"https://dataverse\.harvard\.edu/dataverse/([A-Za-z0-9_-]+)"#).expect("dv re");
+                    for cap in re.captures_iter(&body) {
+                        if let Some(m) = cap.get(1) {
+                            subtrees.push(m.as_str().to_string());
                         }
                     }
-                    Err(_) => continue,
+                    subtrees.sort();
+                    subtrees.dedup();
                 }
-            }
 
-            let mut h = Sha256::new();
-            h.update(link.as_bytes());
-            let url_hash = hex::encode(h.finalize());
-            let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
-            if let Err(e) =
-                process_http_file(client, mode, store_dir, &d.source_id, &key_dataset_id, &link, retries).await
-            {
-                any_failed = true;
-                error!(source_id = %d.source_id, dataset_id = %d.dataset_id, link = %link, error = ?e, "link failed");
+                if subtrees.is_empty() {
+                    warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, "no dataverse subtrees configured/found");
+                    return Ok(());
+                }
+
+                info!(source_id = %d.source_id, dataset_id = %d.dataset_id, subtrees = ?subtrees, "dataverse crawl");
+                let mut any_failed = false;
+                for subtree in subtrees {
+                    let pids = dataverse_list_datasets(client, &subtree).await?;
+                    info!(source_id = %d.source_id, dataset_id = %d.dataset_id, subtree = %subtree, datasets = pids.len(), "dataverse datasets");
+                    for pid in pids {
+                        let files = dataverse_list_files(client, &pid).await?;
+                        for (fid, fname) in files {
+                            let file_url = dataverse_download_file_url(fid).await;
+                            let mut h = Sha256::new();
+                            h.update(file_url.as_bytes());
+                            let url_hash = hex::encode(h.finalize());
+                            let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
+                            // Prefer filename from dataverse in storage path by using content-disposition later; still keep hashed key.
+                            if let Err(e) = process_http_file(
+                                client,
+                                mode,
+                                store_dir,
+                                &d.source_id,
+                                &key_dataset_id,
+                                &file_url,
+                                retries,
+                            )
+                            .await
+                            {
+                                any_failed = true;
+                                error!(
+                                    source_id = %d.source_id,
+                                    dataset_id = %d.dataset_id,
+                                    subtree = %subtree,
+                                    persistent_id = %pid,
+                                    file_id = fid,
+                                    filename = %fname,
+                                    error = ?e,
+                                    "dataverse file failed"
+                                );
+                            }
+                        }
+                    }
+                }
+                if any_failed {
+                    return Err(anyhow!("one or more dataverse downloads failed"));
+                }
+                Ok::<(), anyhow::Error>(())
             }
-        }
-        if any_failed {
-            return Err(anyhow!("one or more crawled links failed"));
-        }
+            _ => {
+                let links = crawl_links(client, &d.url, d.crawl_max_links, d.crawl_same_host_only).await?;
+                info!(source_id = %d.source_id, dataset_id = %d.dataset_id, links = links.len(), strategy = ?d.crawl_strategy, "discovered links");
+                let mut any_failed = false;
+                for link in links {
+                    // Strategy: either only download links with known extensions, or probe with HEAD.
+                    if d.crawl_strategy == CrawlStrategy::ExtensionsOnly {
+                        if let Ok(u) = url::Url::parse(&link) {
+                            if !is_downloadable_link(&u) {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else if d.crawl_strategy == CrawlStrategy::HeadProbe {
+                        match client.head(&link).send().await {
+                            Ok(r) => {
+                                if !r.status().is_success() || !head_says_downloadable(r.headers()) {
+                                    continue;
+                                }
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+
+                    let mut h = Sha256::new();
+                    h.update(link.as_bytes());
+                    let url_hash = hex::encode(h.finalize());
+                    let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
+                    if let Err(e) =
+                        process_http_file(client, mode, store_dir, &d.source_id, &key_dataset_id, &link, retries).await
+                    {
+                        any_failed = true;
+                        error!(source_id = %d.source_id, dataset_id = %d.dataset_id, link = %link, error = ?e, "link failed");
+                    }
+                }
+                if any_failed {
+                    return Err(anyhow!("one or more crawled links failed"));
+                }
+                Ok(())
+            }
+        }?;
         return Ok(());
     }
 
