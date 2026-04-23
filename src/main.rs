@@ -606,7 +606,84 @@ struct DataverseEnumerationCache {
     datasets: usize,
     files: usize,
     total_bytes: Option<u64>,
+    datasets_meta: BTreeMap<String, DataverseDatasetMeta>,
     items: Vec<DataverseFilePlanItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataverseDatasetMeta {
+    title: Option<String>,
+    description: Option<String>,
+}
+
+async fn dataverse_get_dataset_meta(client: &reqwest::Client, persistent_id: &str) -> Result<DataverseDatasetMeta> {
+    let url = format!(
+        "https://dataverse.harvard.edu/api/datasets/:persistentId/?persistentId={}",
+        urlencoding::encode(persistent_id)
+    );
+    let r = client.get(&url).send().await.with_context(|| format!("dataverse dataset meta {persistent_id}"))?;
+    if !r.status().is_success() {
+        return Err(anyhow!("dataverse dataset meta fetch failed {persistent_id} status {}", r.status()));
+    }
+    let v: serde_json::Value = r.json().await.context("parse dataverse dataset meta json")?;
+
+    let mut title: Option<String> = None;
+    let mut descs: Vec<String> = Vec::new();
+
+    let fields = v
+        .get("data")
+        .and_then(|d| d.get("latestVersion"))
+        .and_then(|lv| lv.get("metadataBlocks"))
+        .and_then(|mb| mb.get("citation"))
+        .and_then(|c| c.get("fields"))
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for f in fields {
+        let Some(type_name) = f.get("typeName").and_then(|x| x.as_str()) else { continue };
+        match type_name {
+            "title" => {
+                if let Some(v) = f.get("value").and_then(|x| x.as_str()) {
+                    title = Some(v.to_string());
+                }
+            }
+            "dsDescription" => {
+                if let Some(arr) = f.get("value").and_then(|x| x.as_array()) {
+                    for item in arr {
+                        // item.dsDescriptionValue.value is typical
+                        let val = item
+                            .get("dsDescriptionValue")
+                            .and_then(|x| x.get("value"))
+                            .and_then(|x| x.as_str());
+                        if let Some(s) = val {
+                            let s = s.trim();
+                            if !s.is_empty() {
+                                descs.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let description = if descs.is_empty() {
+        None
+    } else {
+        let mut merged = String::new();
+        for (i, d) in descs.into_iter().enumerate() {
+            if i > 0 {
+                merged.push('\n');
+                merged.push('\n');
+            }
+            merged.push_str(&d);
+        }
+        Some(merged)
+    };
+
+    Ok(DataverseDatasetMeta { title, description })
 }
 
 async fn ensure_dataverse_enumeration(
@@ -643,10 +720,23 @@ async fn ensure_dataverse_enumeration(
     let mut total_datasets: usize = 0;
     let mut total_bytes: u64 = 0;
     let mut any_size: bool = false;
+    let mut datasets_meta: BTreeMap<String, DataverseDatasetMeta> = BTreeMap::new();
     for subtree in &subtrees {
         let pids = dataverse_list_datasets(client, subtree).await?;
         total_datasets += pids.len();
         for pid in pids {
+            if !datasets_meta.contains_key(&pid) {
+                // Best-effort metadata; don't fail enumeration if a single dataset meta fetch fails.
+                match dataverse_get_dataset_meta(client, &pid).await {
+                    Ok(m) => {
+                        datasets_meta.insert(pid.clone(), m);
+                    }
+                    Err(e) => {
+                        warn!(persistent_id = %pid, error = ?e, "dataverse meta fetch failed");
+                        datasets_meta.insert(pid.clone(), DataverseDatasetMeta { title: None, description: None });
+                    }
+                }
+            }
             let files = dataverse_list_files(client, &pid).await?;
             for (fid, fname, size) in files {
                 let url = dataverse_download_file_url(fid).await;
@@ -674,6 +764,7 @@ async fn ensure_dataverse_enumeration(
         datasets: total_datasets,
         files: items.len(),
         total_bytes: if any_size { Some(total_bytes) } else { None },
+        datasets_meta,
         items,
     };
     write_json_file(&path, &cache)?;
