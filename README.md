@@ -1,35 +1,40 @@
 # pollstats
 
-Config-driven downloader + local data store for US politics datasets, with optional ingestion into Postgres.
+Config-driven downloader + local data store for US politics datasets, with optional Postgres ingest of manifest metadata.
 
 ## Quick start
 
-1) Start Postgres (optional):
+1) Build:
+- `cargo build`
+
+2) List configured datasets:
+- `cargo run -- list`
+
+3) Check remote vs local:
+- `cargo run -- check`
+
+4) Update local store (download only if remote is newer):
+- `cargo run -- update`
+
+5) Force download (replace local regardless):
+- `cargo run -- download`
+
+6) Postgres (optional):
 - `docker compose -f tmp/docker-compose.yaml up -d`
+- `cargo run -- pg-init`
+- `cargo run -- pg-load`
 
-2) Create a virtualenv and install deps:
-- `python -m venv .venv && . .venv/bin/activate`
-- `pip install -r requirements.txt`
+## Config (TOML)
 
-3) List configured datasets:
-- `python scripts/pollstats.py list`
+- `config/pollstats.toml` (store location, Postgres URL, HTTP settings)
+- `config/sources.toml` (sources + datasets)
 
-4) Download/update local store (idempotent):
-- `python scripts/pollstats.py update`
-
-5) Ingest download metadata into Postgres:
-- `python scripts/pollstats.py pg-init`
-- `python scripts/pollstats.py pg-load`
+Override:
+- `POLLSTATS_CONFIG` (path to `pollstats.toml`)
+- `POLLSTATS_PG_URL` (Postgres URL)
 
 ## Data layout
 
-- `data_store/raw/<source_id>/<dataset_id>/latest/` contains the latest fetched artifact(s)
-- `data_store/raw/<source_id>/<dataset_id>/history/<timestamp>/` contains older versions (optional, controlled by config)
-- `data_store/manifests/<source_id>/<dataset_id>.json` tracks ETag/Last-Modified/SHA256 so updates are idempotent
-
-## Config
-
-Edit:
-- `config/sources.yaml` (what to download + how)
-- `config/pollstats.yaml` (where to store + Postgres URL)
-
+- `data_store/raw/<source_id>/<dataset_id>/latest/` latest fetched artifact(s)
+- `data_store/raw/<source_id>/<dataset_id>/history/<timestamp>/` older versions (when content SHA changes)
+- `data_store/manifests/<source_id>/<dataset_id>.json` tracks ETag/Last-Modified/SHA256

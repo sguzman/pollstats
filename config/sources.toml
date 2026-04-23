@@ -1,0 +1,94 @@
+[[sources]]
+id = "medsl"
+name = "MIT Election Data and Science Lab (MEDSL)"
+homepage = "https://electionlab.mit.edu/"
+
+  [[sources.datasets]]
+  id = "landing"
+  name = "MEDSL datasets landing page"
+  type = "http_page"
+  url = "https://electionlab.mit.edu/data"
+
+[[sources]]
+id = "fec"
+name = "Federal Election Commission (FEC)"
+homepage = "https://www.fec.gov/"
+
+  [[sources.datasets]]
+  id = "bulk-data"
+  name = "FEC bulk data landing page"
+  type = "http_page"
+  url = "https://www.fec.gov/data/browse-data/?tab=bulk-data"
+
+[[sources]]
+id = "census"
+name = "US Census Bureau"
+homepage = "https://www.census.gov/"
+
+  [[sources.datasets]]
+  id = "cps-voting-registration"
+  name = "CPS Voting and Registration tables (landing)"
+  type = "http_page"
+  url = "https://www.census.gov/topics/public-sector/voting/data.html"
+
+  [[sources.datasets]]
+  id = "cvap"
+  name = "Citizen Voting Age Population (CVAP) (landing)"
+  type = "http_page"
+  url = "https://www.census.gov/programs-surveys/cvap.html"
+
+[[sources]]
+id = "us-elections-project"
+name = "United States Elections Project"
+homepage = "https://www.electproject.org/"
+
+  [[sources.datasets]]
+  id = "turnout"
+  name = "Turnout and VEP/VAP series (landing)"
+  type = "http_page"
+  url = "https://www.electproject.org/national-1789-present"
+
+[[sources]]
+id = "openelections"
+name = "OpenElections"
+homepage = "https://openelections.net/"
+
+  [[sources.datasets]]
+  id = "github"
+  name = "GitHub organization (landing)"
+  type = "http_page"
+  url = "https://github.com/openelections"
+
+[[sources]]
+id = "anes"
+name = "American National Election Studies (ANES)"
+homepage = "https://electionstudies.org/"
+
+  [[sources.datasets]]
+  id = "data-center"
+  name = "ANES Data Center (landing)"
+  type = "http_page"
+  url = "https://electionstudies.org/data-center/"
+
+[[sources]]
+id = "ces"
+name = "Cooperative Election Study (CES/CCES)"
+homepage = "https://cces.gov.harvard.edu/"
+
+  [[sources.datasets]]
+  id = "data"
+  name = "CES data (landing)"
+  type = "http_page"
+  url = "https://cces.gov.harvard.edu/data"
+
+[[sources]]
+id = "alged"
+name = "American Local Government Elections Database (ALGED)"
+homepage = "https://www.localgovtelections.org/"
+
+  [[sources.datasets]]
+  id = "data"
+  name = "ALGED data (landing)"
+  type = "http_page"
+  url = "https://www.localgovtelections.org/data"
+

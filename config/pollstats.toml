@@ -1,0 +1,14 @@
+# Override via env:
+# - POLLSTATS_CONFIG (path to this file)
+# - POLLSTATS_PG_URL (Postgres URL)
+
+store_dir = "data_store"
+sources_file = "config/sources.toml"
+
+# Example: "postgresql://admin:admin@localhost:5432/data?sslmode=disable"
+postgres_url = "postgresql://admin:admin@localhost:5432/data?sslmode=disable"
+
+# HTTP
+http_timeout_seconds = 60
+user_agent = "pollstats/0.1 (+local)"
+
