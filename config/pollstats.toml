@@ -24,3 +24,18 @@ download_concurrency = 1
 
 # Download rate limit (kilobytes per second) to improve robustness on flaky connections.
 download_rate_limit_kbps = 500
+
+[aria]
+# Where to write aria2 artifacts (relative to project dir).
+output_dir = ".cache/pollstats/aria"
+urls_filename = "urls"
+conf_filename = "aria2.conf"
+
+# Default conf template to copy (and optionally patch) if `aria.emit` is not set.
+conf_template_file = "tmp/conf.conf"
+
+[aria.emit]
+# Optional: if set (non-empty), emit these exact key/value lines into aria2.conf.
+# Example keys (quote keys containing hyphens):
+# "max-concurrent-downloads" = "1"
+# "max-download-limit" = "500000"
