@@ -219,6 +219,13 @@ fn manifest_path(store_dir: &Path, d: &Dataset) -> PathBuf {
         .join(format!("{}.json", d.dataset_id))
 }
 
+fn enumeration_path(store_dir: &Path, d: &Dataset) -> PathBuf {
+    store_dir
+        .join("enumerations")
+        .join(&d.source_id)
+        .join(format!("{}.json", d.dataset_id))
+}
+
 fn latest_dir(store_dir: &Path, d: &Dataset) -> PathBuf {
     store_dir
         .join("raw")
@@ -254,6 +261,23 @@ fn write_manifest(path: &Path, m: &Manifest) -> Result<()> {
     fs::write(&tmp, format!("{txt}\n")).with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+fn write_json_file<T: Serialize>(path: &Path, obj: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let txt = serde_json::to_string_pretty(obj).context("serialize json")?;
+    fs::write(&tmp, format!("{txt}\n")).with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    let txt = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let obj: T = serde_json::from_str(&txt).with_context(|| format!("parse {}", path.display()))?;
+    Ok(obj)
 }
 
 fn now_iso() -> Result<String> {
@@ -460,6 +484,89 @@ async fn dataverse_list_files(client: &reqwest::Client, persistent_id: &str) -> 
 
 async fn dataverse_download_file_url(datafile_id: i64) -> String {
     format!("https://dataverse.harvard.edu/api/access/datafile/{datafile_id}")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataverseFilePlanItem {
+    subtree: String,
+    persistent_id: String,
+    file_id: i64,
+    filename: String,
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataverseEnumerationCache {
+    source_id: String,
+    dataset_id: String,
+    subtrees: Vec<String>,
+    enumerated_at: String,
+    datasets: usize,
+    files: usize,
+    items: Vec<DataverseFilePlanItem>,
+}
+
+async fn ensure_dataverse_enumeration(
+    client: &reqwest::Client,
+    store_dir: &Path,
+    d: &Dataset,
+    refresh: bool,
+) -> Result<DataverseEnumerationCache> {
+    let path = enumeration_path(store_dir, d);
+    if !refresh && path.exists() {
+        return read_json_file(&path);
+    }
+
+    let enumerated_at = now_iso()?;
+    let mut subtrees = d.dataverse_subtrees.clone();
+    if subtrees.is_empty() {
+        let resp = client.get(&d.url).send().await.with_context(|| format!("get page {}", d.url))?;
+        let body = resp.text().await.context("read page body")?;
+        let re = Regex::new(r#"https://dataverse\.harvard\.edu/dataverse/([A-Za-z0-9_-]+)"#).expect("dv re");
+        for cap in re.captures_iter(&body) {
+            if let Some(m) = cap.get(1) {
+                subtrees.push(m.as_str().to_string());
+            }
+        }
+        subtrees.sort();
+        subtrees.dedup();
+    }
+
+    if subtrees.is_empty() {
+        return Err(anyhow!("no dataverse subtrees configured/found"));
+    }
+
+    let mut items: Vec<DataverseFilePlanItem> = Vec::new();
+    let mut total_datasets: usize = 0;
+    for subtree in &subtrees {
+        let pids = dataverse_list_datasets(client, subtree).await?;
+        total_datasets += pids.len();
+        for pid in pids {
+            let files = dataverse_list_files(client, &pid).await?;
+            for (fid, fname) in files {
+                let url = dataverse_download_file_url(fid).await;
+                items.push(DataverseFilePlanItem {
+                    subtree: subtree.clone(),
+                    persistent_id: pid.clone(),
+                    file_id: fid,
+                    filename: fname,
+                    url,
+                });
+            }
+        }
+    }
+
+    let cache = DataverseEnumerationCache {
+        source_id: d.source_id.clone(),
+        dataset_id: d.dataset_id.clone(),
+        subtrees,
+        enumerated_at,
+        datasets: total_datasets,
+        files: items.len(),
+        items,
+    };
+    write_json_file(&path, &cache)?;
+    Ok(cache)
 }
 
 async fn crawl_links(
@@ -806,6 +913,7 @@ async fn process_dataset(
     d: &Dataset,
     retries: u32,
     rate_limit_bps: u64,
+    check_refresh: bool,
 ) -> Result<()> {
     if d.kind == "http_page" {
         let mp = manifest_path(store_dir, d);
@@ -826,81 +934,54 @@ async fn process_dataset(
 
         match d.crawl_strategy {
             CrawlStrategy::Dataverse => {
-                let mut subtrees = d.dataverse_subtrees.clone();
-                if subtrees.is_empty() {
-                    // Try to extract dataverse aliases from the page itself.
-                    let resp = client.get(&d.url).send().await.with_context(|| format!("get page {}", d.url))?;
-                    let body = resp.text().await.context("read page body")?;
-                    let re = Regex::new(r#"https://dataverse\.harvard\.edu/dataverse/([A-Za-z0-9_-]+)"#).expect("dv re");
-                    for cap in re.captures_iter(&body) {
-                        if let Some(m) = cap.get(1) {
-                            subtrees.push(m.as_str().to_string());
-                        }
-                    }
-                    subtrees.sort();
-                    subtrees.dedup();
-                }
-
-                if subtrees.is_empty() {
-                    warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, "no dataverse subtrees configured/found");
-                    return Ok(());
-                }
-
-                info!(source_id = %d.source_id, dataset_id = %d.dataset_id, subtrees = ?subtrees, "dataverse crawl");
-                let mut any_failed = false;
-                let mut total_datasets: usize = 0;
-                let mut total_files: usize = 0;
-                for subtree in subtrees {
-                    let pids = dataverse_list_datasets(client, &subtree).await?;
-                    total_datasets += pids.len();
-                    info!(source_id = %d.source_id, dataset_id = %d.dataset_id, subtree = %subtree, datasets = pids.len(), "dataverse datasets");
-                    for pid in pids {
-                        let files = dataverse_list_files(client, &pid).await?;
-                        total_files += files.len();
-                        if matches!(mode, Mode::Check) {
-                            continue;
-                        }
-                        for (fid, fname) in files {
-                            let file_url = dataverse_download_file_url(fid).await;
-                            let mut h = Sha256::new();
-                            h.update(file_url.as_bytes());
-                            let url_hash = hex::encode(h.finalize());
-                            let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
-                            // Prefer filename from dataverse in storage path by using content-disposition later; still keep hashed key.
-                            if let Err(e) = process_http_file(
-                                client,
-                                mode,
-                                store_dir,
-                                &d.source_id,
-                                &key_dataset_id,
-                                &file_url,
-                                retries,
-                                rate_limit_bps,
-                            )
-                            .await
-                            {
-                                any_failed = true;
-                                error!(
-                                    source_id = %d.source_id,
-                                    dataset_id = %d.dataset_id,
-                                    subtree = %subtree,
-                                    persistent_id = %pid,
-                                    file_id = fid,
-                                    filename = %fname,
-                                    error = ?e,
-                                    "dataverse file failed"
-                                );
-                            }
-                        }
-                    }
-                }
+                let refresh = matches!(mode, Mode::Check) && check_refresh;
+                let cache = ensure_dataverse_enumeration(client, store_dir, d, refresh).await?;
                 info!(
                     source_id = %d.source_id,
                     dataset_id = %d.dataset_id,
-                    datasets = total_datasets,
-                    files = total_files,
-                    "dataverse summary"
+                    enumerated_at = %cache.enumerated_at,
+                    datasets = cache.datasets,
+                    files = cache.files,
+                    subtrees = ?cache.subtrees,
+                    "dataverse enumeration"
                 );
+
+                if matches!(mode, Mode::Check) {
+                    return Ok(());
+                }
+
+                let mut any_failed = false;
+                for it in cache.items {
+                    let mut h = Sha256::new();
+                    h.update(it.url.as_bytes());
+                    let url_hash = hex::encode(h.finalize());
+                    let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
+                    if let Err(e) = process_http_file(
+                        client,
+                        mode,
+                        store_dir,
+                        &d.source_id,
+                        &key_dataset_id,
+                        &it.url,
+                        retries,
+                        rate_limit_bps,
+                    )
+                    .await
+                    {
+                        any_failed = true;
+                        error!(
+                            source_id = %d.source_id,
+                            dataset_id = %d.dataset_id,
+                            subtree = %it.subtree,
+                            persistent_id = %it.persistent_id,
+                            file_id = it.file_id,
+                            filename = %it.filename,
+                            url = %it.url,
+                            error = ?e,
+                            "dataverse file failed"
+                        );
+                    }
+                }
                 if any_failed {
                     return Err(anyhow!("one or more dataverse downloads failed"));
                 }
@@ -972,7 +1053,7 @@ async fn process_dataset(
     .await
 }
 
-async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
+async fn run_http(mode: Mode, only: Vec<String>, check_refresh: bool) -> Result<i32> {
     let (cfg, sources_cfg) = load_config()?;
     fs::create_dir_all(&cfg.store_dir).with_context(|| format!("mkdir {}", cfg.store_dir.display()))?;
 
@@ -1008,7 +1089,7 @@ async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
         let store_dir = cfg.store_dir.clone();
         let key = format!("{}/{}", d.source_id, d.dataset_id);
         async move {
-            process_dataset(&client, mode, &store_dir, &d, retries, rate_limit_bps)
+            process_dataset(&client, mode, &store_dir, &d, retries, rate_limit_bps, check_refresh)
                 .await
                 .with_context(|| format!("process {key}"))
         }
@@ -1146,9 +1227,9 @@ async fn main() -> Result<()> {
             }
             0
         }
-        Command::Check { only } => run_http(Mode::Check, only).await?,
-        Command::Update { only } => run_http(Mode::UpdateIfNewer, only).await?,
-        Command::Download { only } => run_http(Mode::DownloadAlways, only).await?,
+        Command::Check { only } => run_http(Mode::Check, only, true).await?,
+        Command::Update { only } => run_http(Mode::UpdateIfNewer, only, false).await?,
+        Command::Download { only } => run_http(Mode::DownloadAlways, only, false).await?,
         Command::PgInit => cmd_pg_init().await?,
         Command::PgLoad { only } => cmd_pg_load(only).await?,
     };
