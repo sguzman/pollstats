@@ -679,12 +679,16 @@ async fn process_http_file(
     loop {
         attempt += 1;
 
-        let resp = client
-            .get(&d.url)
-            .headers(headers.clone())
-            .send()
-            .await
-            .with_context(|| format!("get {}", d.url))?;
+    let resp = client
+        .get(&d.url)
+        .headers(headers.clone())
+        .send()
+        .await
+        .with_context(|| format!("get {}", d.url))?;
+        if resp.content_length().is_none() {
+            // Some hosts stream without length; allow, but log because timeouts are more likely.
+            debug!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, "no content-length");
+        }
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
             info!(source_id = %d.source_id, dataset_id = %d.dataset_id, "304 not modified");
             return Ok(());
@@ -736,6 +740,8 @@ async fn process_http_file(
                     .unwrap_or(false);
                 if is_timeout && attempt < retries.max(1) {
                     warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, attempt, error = ?e, "download timed out; retrying");
+                    // crude backoff
+                    tokio::time::sleep(std::time::Duration::from_secs(2_u64.saturating_mul(attempt as u64))).await;
                     continue;
                 }
                 return Err(e);
