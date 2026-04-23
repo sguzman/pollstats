@@ -43,6 +43,7 @@ struct SourcesConfig {
 struct Source {
     id: String,
     name: Option<String>,
+    #[allow(dead_code)]
     homepage: Option<String>,
     datasets: Vec<DatasetConfig>,
 }
@@ -59,6 +60,7 @@ struct DatasetConfig {
 #[derive(Debug, Clone)]
 struct Dataset {
     source_id: String,
+    #[allow(dead_code)]
     source_name: String,
     dataset_id: String,
     dataset_name: String,
