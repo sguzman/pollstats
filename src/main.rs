@@ -1101,6 +1101,31 @@ fn write_aria_conf(cfg: &AppConfig, conf_path: &Path, urls_path: &Path) -> Resul
         }
     }
 
+    // Ensure aria2 behaves like our downloader w.r.t. already-downloaded files:
+    // don't overwrite, don't auto-rename, and resume partials.
+    // Remove any existing settings for these keys to avoid ambiguity.
+    let forced = [
+        ("allow-overwrite", "false"),
+        ("auto-file-renaming", "false"),
+        ("continue", "true"),
+    ];
+    lines.retain(|l| {
+        let t = l.trim_start();
+        if t.starts_with('#') {
+            return true;
+        }
+        for (k, _) in forced {
+            if t.starts_with(k) && t[k.len()..].trim_start().starts_with('=') {
+                return false;
+            }
+        }
+        true
+    });
+    lines.push("# pollstats defaults (do not overwrite existing downloads)".to_string());
+    for (k, v) in forced {
+        lines.push(format!("{k}={v}"));
+    }
+
     let txt = lines.join("\n") + "\n";
     fs::write(conf_path, txt).with_context(|| format!("write {}", conf_path.display()))?;
     Ok(())
