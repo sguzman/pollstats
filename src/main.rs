@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_postgres::NoTls;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
+use regex::Regex;
 
 #[derive(Debug, Clone, Deserialize)]
 struct AppConfig {
@@ -60,6 +61,7 @@ struct DatasetConfig {
     crawl_download: Option<bool>,
     crawl_max_links: Option<usize>,
     crawl_same_host_only: Option<bool>,
+    crawl_strategy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +76,22 @@ struct Dataset {
     crawl_download: bool,
     crawl_max_links: usize,
     crawl_same_host_only: bool,
+    crawl_strategy: CrawlStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrawlStrategy {
+    ExtensionsOnly,
+    HeadProbe,
+}
+
+impl CrawlStrategy {
+    fn from_opt(s: Option<&str>) -> Self {
+        match s.unwrap_or("extensions").to_ascii_lowercase().as_str() {
+            "head" | "headprobe" | "probe" => Self::HeadProbe,
+            _ => Self::ExtensionsOnly,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -180,6 +198,7 @@ fn iter_datasets(sources_cfg: &SourcesConfig) -> Vec<Dataset> {
                 crawl_download: d.crawl_download.unwrap_or(false),
                 crawl_max_links: d.crawl_max_links.unwrap_or(200),
                 crawl_same_host_only: d.crawl_same_host_only.unwrap_or(true),
+                crawl_strategy: CrawlStrategy::from_opt(d.crawl_strategy.as_deref()),
             });
         }
     }
@@ -280,6 +299,56 @@ fn is_downloadable_link(url: &url::Url) -> bool {
     exts.iter().any(|e| path.ends_with(e))
 }
 
+fn is_html_content_type(ct: &str) -> bool {
+    let ct = ct.to_ascii_lowercase();
+    ct.starts_with("text/html") || ct.starts_with("application/xhtml")
+}
+
+fn head_says_downloadable(headers: &HeaderMap) -> bool {
+    if let Some(v) = headers.get(reqwest::header::CONTENT_DISPOSITION) {
+        if let Ok(s) = v.to_str() {
+            if s.to_ascii_lowercase().contains("attachment") {
+                return true;
+            }
+        }
+    }
+    let Some(ct) = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    if is_html_content_type(&ct) {
+        return false;
+    }
+    // Explicitly allow common data-ish MIME types.
+    if ct.starts_with("text/csv")
+        || ct.starts_with("text/tab-separated-values")
+        || ct.starts_with("application/zip")
+        || ct.starts_with("application/gzip")
+        || ct.starts_with("application/x-gzip")
+        || ct.starts_with("application/json")
+        || ct.starts_with("application/octet-stream")
+        || ct.starts_with("application/vnd.ms-excel")
+        || ct.starts_with("application/vnd.openxmlformats-officedocument")
+    {
+        return true;
+    }
+    // Avoid pulling site assets.
+    if ct.starts_with("text/css")
+        || ct.starts_with("text/javascript")
+        || ct.starts_with("application/javascript")
+        || ct.starts_with("image/")
+        || ct.starts_with("font/")
+        || ct.starts_with("text/plain")
+    {
+        return false;
+    }
+    // Default deny.
+    false
+}
+
 async fn crawl_links(
     client: &reqwest::Client,
     base_url: &str,
@@ -300,7 +369,7 @@ async fn crawl_links(
     let doc = Html::parse_document(&body);
     let sel = Selector::parse("a[href]").expect("selector");
 
-    let mut out = Vec::new();
+    let mut out: Vec<url::Url> = Vec::new();
     for el in doc.select(&sel) {
         let Some(href) = el.value().attr("href") else { continue };
         let href = href.trim();
@@ -315,18 +384,53 @@ async fn crawl_links(
         if same_host_only && u.host_str() != base.host_str() {
             continue;
         }
-        if !is_downloadable_link(&u) {
-            continue;
-        }
-        out.push(u.to_string());
+        out.push(u);
         if out.len() >= max_links {
             break;
         }
     }
 
-    out.sort();
-    out.dedup();
-    Ok(out)
+    // Fallback: embedded absolute/root-relative URLs (common in JS apps).
+    if out.len() < max_links {
+        let re_abs = Regex::new(r#"https?://[^\s"'<>\\]+(\?[^\s"'<>\\]+)?"#).expect("re_abs");
+        for m in re_abs.find_iter(&body) {
+            if let Ok(u) = url::Url::parse(m.as_str()) {
+                if u.scheme() != "http" && u.scheme() != "https" {
+                    continue;
+                }
+                if same_host_only && u.host_str() != base.host_str() {
+                    continue;
+                }
+                out.push(u);
+                if out.len() >= max_links {
+                    break;
+                }
+            }
+        }
+    }
+
+    if out.len() < max_links {
+        let re_rel = Regex::new(r#""(/[^"'<>\\]+)""#).expect("re_rel");
+        for cap in re_rel.captures_iter(&body) {
+            let Some(rel) = cap.get(1) else { continue };
+            if let Ok(u) = base.join(rel.as_str()) {
+                if u.scheme() != "http" && u.scheme() != "https" {
+                    continue;
+                }
+                if same_host_only && u.host_str() != base.host_str() {
+                    continue;
+                }
+                out.push(u);
+                if out.len() >= max_links {
+                    break;
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    out.dedup_by(|a, b| a.as_str() == b.as_str());
+    Ok(out.into_iter().map(|u| u.to_string()).collect())
 }
 
 async fn sha256_file(path: &Path) -> Result<String> {
@@ -365,6 +469,7 @@ async fn process_http_file(
         crawl_download: false,
         crawl_max_links: 0,
         crawl_same_host_only: false,
+        crawl_strategy: CrawlStrategy::ExtensionsOnly,
     };
 
     let mp = manifest_path(store_dir, &d);
@@ -442,11 +547,12 @@ async fn process_http_file(
         .with_context(|| format!("mkdir {}", ldir.display()))?;
 
     let mut attempt: u32 = 0;
-    let mut bytes_written: u64;
+    #[allow(unused_assignments)]
+    let mut bytes_written: u64 = 0;
+    #[allow(unused_assignments)]
     let mut out: Option<PathBuf> = None;
     loop {
         attempt += 1;
-        bytes_written = 0;
 
         let resp = client
             .get(&d.url)
@@ -575,9 +681,29 @@ async fn process_dataset(
         }
 
         let links = crawl_links(client, &d.url, d.crawl_max_links, d.crawl_same_host_only).await?;
-        info!(source_id = %d.source_id, dataset_id = %d.dataset_id, links = links.len(), "discovered links");
+        info!(source_id = %d.source_id, dataset_id = %d.dataset_id, links = links.len(), strategy = ?d.crawl_strategy, "discovered links");
         let mut any_failed = false;
         for link in links {
+            // Strategy: either only download links with known extensions, or probe with HEAD.
+            if d.crawl_strategy == CrawlStrategy::ExtensionsOnly {
+                if let Ok(u) = url::Url::parse(&link) {
+                    if !is_downloadable_link(&u) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else if d.crawl_strategy == CrawlStrategy::HeadProbe {
+                match client.head(&link).send().await {
+                    Ok(r) => {
+                        if !r.status().is_success() || !head_says_downloadable(r.headers()) {
+                            continue;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+
             let mut h = Sha256::new();
             h.update(link.as_bytes());
             let url_hash = hex::encode(h.finalize());

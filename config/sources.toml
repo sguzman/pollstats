@@ -11,6 +11,7 @@ homepage = "https://electionlab.mit.edu/"
   crawl_download = true
   crawl_max_links = 200
   crawl_same_host_only = false
+  crawl_strategy = "head"
 
 [[sources]]
 id = "fec"
@@ -23,7 +24,7 @@ homepage = "https://www.fec.gov/"
   type = "http_page"
   url = "https://www.fec.gov/data/browse-data/?tab=bulk-data"
   crawl_download = true
-  crawl_max_links = 200
+  crawl_max_links = 2000
   crawl_same_host_only = false
 
 [[sources]]
@@ -39,6 +40,7 @@ homepage = "https://www.census.gov/"
   crawl_download = true
   crawl_max_links = 200
   crawl_same_host_only = false
+  crawl_strategy = "head"
 
   [[sources.datasets]]
   id = "cvap"
@@ -62,6 +64,7 @@ homepage = "https://www.electproject.org/"
   crawl_download = true
   crawl_max_links = 200
   crawl_same_host_only = false
+  crawl_strategy = "head"
 
 [[sources]]
 id = "openelections"
