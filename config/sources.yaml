@@ -1,0 +1,85 @@
+# Add datasets here. Each dataset can be:
+# - type: http_file (direct file URL; idempotent via ETag/Last-Modified, fallback to sha256)
+# - type: http_page (landing page only; records metadata but does not download)
+#
+# Notes:
+# - Many high-quality political datasets have click-through terms or require registration (ANES/CES).
+#   Keep those as http_page until you have a stable, permitted direct download URL.
+
+sources:
+  - id: medsl
+    name: MIT Election Data and Science Lab (MEDSL)
+    homepage: https://electionlab.mit.edu/
+    datasets:
+      - id: landing
+        name: MEDSL datasets landing page
+        type: http_page
+        url: https://electionlab.mit.edu/data
+
+  - id: fec
+    name: Federal Election Commission (FEC)
+    homepage: https://www.fec.gov/
+    datasets:
+      - id: bulk-data
+        name: FEC bulk data landing page
+        type: http_page
+        url: https://www.fec.gov/data/browse-data/?tab=bulk-data
+
+  - id: census
+    name: US Census Bureau
+    homepage: https://www.census.gov/
+    datasets:
+      - id: cps-voting-registration
+        name: CPS Voting and Registration tables (landing)
+        type: http_page
+        url: https://www.census.gov/topics/public-sector/voting/data.html
+      - id: cvap
+        name: Citizen Voting Age Population (CVAP) (landing)
+        type: http_page
+        url: https://www.census.gov/programs-surveys/cvap.html
+
+  - id: us-elections-project
+    name: United States Elections Project
+    homepage: https://www.electproject.org/
+    datasets:
+      - id: turnout
+        name: Turnout and VEP/VAP series (landing)
+        type: http_page
+        url: https://www.electproject.org/national-1789-present
+
+  - id: openelections
+    name: OpenElections
+    homepage: https://openelections.net/
+    datasets:
+      - id: github
+        name: GitHub repository (landing)
+        type: http_page
+        url: https://github.com/openelections
+
+  - id: anes
+    name: American National Election Studies (ANES)
+    homepage: https://electionstudies.org/
+    datasets:
+      - id: data-center
+        name: ANES Data Center (landing)
+        type: http_page
+        url: https://electionstudies.org/data-center/
+
+  - id: ces
+    name: Cooperative Election Study (CES/CCES)
+    homepage: https://cces.gov.harvard.edu/
+    datasets:
+      - id: data
+        name: CES data (landing)
+        type: http_page
+        url: https://cces.gov.harvard.edu/data
+
+  - id: alged
+    name: American Local Government Elections Database (ALGED)
+    homepage: https://www.localgovtelections.org/
+    datasets:
+      - id: data
+        name: ALGED data (landing)
+        type: http_page
+        url: https://www.localgovtelections.org/data
+
