@@ -239,6 +239,25 @@ fn resolve_dataset_headers(mut headers: BTreeMap<String, String>, cookie_file: O
 
 fn read_cookiejar_for_domain(path: &Path, domain: &str) -> Result<String> {
     let txt = fs::read_to_string(path).with_context(|| format!("read cookie file {}", path.display()))?;
+    // If the user pasted a raw Cookie header value (common from DevTools "Copy request headers"),
+    // accept it as-is.
+    let trimmed = txt.trim();
+    if !trimmed.is_empty() {
+        let first_line = trimmed.lines().next().unwrap_or("").trim();
+        if first_line.to_ascii_lowercase().starts_with("cookie:") {
+            return Ok(first_line["cookie:".len()..].trim().to_string());
+        }
+        // Heuristic: if it looks like "a=b; c=d" and not a Netscape cookiejar, accept it.
+        if !first_line.contains('\t') && first_line.contains('=') {
+            let raw = trimmed
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Ok(raw.trim().to_string());
+        }
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
