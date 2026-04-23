@@ -523,6 +523,8 @@ struct DataverseDatasetFileWrapper {
 struct DataverseDataFile {
     id: i64,
     filename: String,
+    #[serde(default)]
+    filesize: Option<u64>,
 }
 
 async fn dataverse_list_datasets(client: &reqwest::Client, subtree: &str) -> Result<Vec<String>> {
@@ -564,7 +566,7 @@ async fn dataverse_list_datasets(client: &reqwest::Client, subtree: &str) -> Res
     Ok(out)
 }
 
-async fn dataverse_list_files(client: &reqwest::Client, persistent_id: &str) -> Result<Vec<(i64, String)>> {
+async fn dataverse_list_files(client: &reqwest::Client, persistent_id: &str) -> Result<Vec<(i64, String, Option<u64>)>> {
     let url = format!(
         "https://dataverse.harvard.edu/api/datasets/:persistentId/?persistentId={}",
         urlencoding::encode(persistent_id)
@@ -576,7 +578,7 @@ async fn dataverse_list_files(client: &reqwest::Client, persistent_id: &str) -> 
     let resp: DataverseDatasetResp = r.json().await.context("parse dataverse dataset json")?;
     let mut out = Vec::new();
     for f in resp.data.latest_version.files {
-        out.push((f.data_file.id, f.data_file.filename));
+        out.push((f.data_file.id, f.data_file.filename, f.data_file.filesize));
     }
     Ok(out)
 }
@@ -591,6 +593,7 @@ struct DataverseFilePlanItem {
     persistent_id: String,
     file_id: i64,
     filename: String,
+    size_bytes: Option<u64>,
     url: String,
 }
 
@@ -602,6 +605,7 @@ struct DataverseEnumerationCache {
     enumerated_at: String,
     datasets: usize,
     files: usize,
+    total_bytes: Option<u64>,
     items: Vec<DataverseFilePlanItem>,
 }
 
@@ -637,18 +641,25 @@ async fn ensure_dataverse_enumeration(
 
     let mut items: Vec<DataverseFilePlanItem> = Vec::new();
     let mut total_datasets: usize = 0;
+    let mut total_bytes: u64 = 0;
+    let mut any_size: bool = false;
     for subtree in &subtrees {
         let pids = dataverse_list_datasets(client, subtree).await?;
         total_datasets += pids.len();
         for pid in pids {
             let files = dataverse_list_files(client, &pid).await?;
-            for (fid, fname) in files {
+            for (fid, fname, size) in files {
                 let url = dataverse_download_file_url(fid).await;
+                if let Some(sz) = size {
+                    total_bytes = total_bytes.saturating_add(sz);
+                    any_size = true;
+                }
                 items.push(DataverseFilePlanItem {
                     subtree: subtree.clone(),
                     persistent_id: pid.clone(),
                     file_id: fid,
                     filename: fname,
+                    size_bytes: size,
                     url,
                 });
             }
@@ -662,6 +673,7 @@ async fn ensure_dataverse_enumeration(
         enumerated_at,
         datasets: total_datasets,
         files: items.len(),
+        total_bytes: if any_size { Some(total_bytes) } else { None },
         items,
     };
     write_json_file(&path, &cache)?;
@@ -1054,6 +1066,7 @@ async fn process_dataset(
                     enumerated_at = %cache.enumerated_at,
                     datasets = cache.datasets,
                     files = cache.files,
+                    total_bytes = cache.total_bytes.unwrap_or(0),
                     subtrees = ?cache.subtrees,
                     "dataverse enumeration"
                 );
@@ -1068,19 +1081,19 @@ async fn process_dataset(
                     h.update(it.url.as_bytes());
                     let url_hash = hex::encode(h.finalize());
                     let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
-                            if let Err(e) = process_http_file(
-                                client,
-                                mode,
-                                store_dir,
-                                &d.source_id,
-                                &key_dataset_id,
-                                &it.url,
-                                retries,
-                                rate_limit_bps,
-                                &BTreeMap::new(),
-                            )
-                            .await
-                            {
+                    if let Err(e) = process_http_file(
+                        client,
+                        mode,
+                        store_dir,
+                        &d.source_id,
+                        &key_dataset_id,
+                        &it.url,
+                        retries,
+                        rate_limit_bps,
+                        &BTreeMap::new(),
+                    )
+                    .await
+                    {
                         any_failed = true;
                         error!(
                             source_id = %d.source_id,
@@ -1089,6 +1102,7 @@ async fn process_dataset(
                             persistent_id = %it.persistent_id,
                             file_id = it.file_id,
                             filename = %it.filename,
+                            size_bytes = it.size_bytes.unwrap_or(0),
                             url = %it.url,
                             error = ?e,
                             "dataverse file failed"
