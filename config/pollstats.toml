@@ -14,8 +14,9 @@ db = "data"
 sslmode = "disable"
 
 # HTTP
-http_timeout_seconds = 60
+http_timeout_seconds = 600
 user_agent = "pollstats/0.1 (+local)"
+http_retries = 3
 
 # How aggressively to fetch datasets.
 # 1 = download each one at a time (default).

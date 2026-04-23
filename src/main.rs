@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue};
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{format_description, OffsetDateTime};
@@ -22,6 +23,7 @@ struct AppConfig {
     http_timeout_seconds: Option<u64>,
     user_agent: Option<String>,
     download_concurrency: Option<usize>,
+    http_retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +57,9 @@ struct DatasetConfig {
     #[serde(rename = "type")]
     kind: String,
     url: String,
+    crawl_download: Option<bool>,
+    crawl_max_links: Option<usize>,
+    crawl_same_host_only: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +71,9 @@ struct Dataset {
     dataset_name: String,
     kind: String,
     url: String,
+    crawl_download: bool,
+    crawl_max_links: usize,
+    crawl_same_host_only: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -169,6 +177,9 @@ fn iter_datasets(sources_cfg: &SourcesConfig) -> Vec<Dataset> {
                 dataset_name: d.name.clone().unwrap_or_else(|| d.id.clone()),
                 kind: d.kind.clone(),
                 url: d.url.clone(),
+                crawl_download: d.crawl_download.unwrap_or(false),
+                crawl_max_links: d.crawl_max_links.unwrap_or(200),
+                crawl_same_host_only: d.crawl_same_host_only.unwrap_or(true),
             });
         }
     }
@@ -260,6 +271,64 @@ fn suggest_filename(url: &str, headers: &HeaderMap) -> String {
     "download.bin".to_string()
 }
 
+fn is_downloadable_link(url: &url::Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+    let exts = [
+        ".csv", ".tsv", ".json", ".geojson", ".zip", ".gz", ".bz2", ".xz", ".parquet", ".feather",
+        ".xlsx", ".xls", ".sav", ".dta",
+    ];
+    exts.iter().any(|e| path.ends_with(e))
+}
+
+async fn crawl_links(
+    client: &reqwest::Client,
+    base_url: &str,
+    max_links: usize,
+    same_host_only: bool,
+) -> Result<Vec<String>> {
+    let base = url::Url::parse(base_url).with_context(|| format!("parse url {base_url}"))?;
+    let resp = client
+        .get(base_url)
+        .send()
+        .await
+        .with_context(|| format!("get page {base_url}"))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("page fetch failed {base_url} status {}", resp.status()));
+    }
+    let body = resp.text().await.context("read page body")?;
+
+    let doc = Html::parse_document(&body);
+    let sel = Selector::parse("a[href]").expect("selector");
+
+    let mut out = Vec::new();
+    for el in doc.select(&sel) {
+        let Some(href) = el.value().attr("href") else { continue };
+        let href = href.trim();
+        if href.is_empty() || href.starts_with('#') || href.starts_with("javascript:") || href.starts_with("mailto:") {
+            continue;
+        }
+        let resolved = base.join(href).ok();
+        let Some(u) = resolved else { continue };
+        if u.scheme() != "http" && u.scheme() != "https" {
+            continue;
+        }
+        if same_host_only && u.host_str() != base.host_str() {
+            continue;
+        }
+        if !is_downloadable_link(&u) {
+            continue;
+        }
+        out.push(u.to_string());
+        if out.len() >= max_links {
+            break;
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 async fn sha256_file(path: &Path) -> Result<String> {
     let bytes = tokio::fs::read(path)
         .await
@@ -277,25 +346,30 @@ fn is_selected(only: &[String], d: &Dataset) -> bool {
     only.iter().any(|x| x == &key)
 }
 
-async fn process_dataset(client: &reqwest::Client, mode: Mode, store_dir: &Path, d: &Dataset) -> Result<()> {
-    let mp = manifest_path(store_dir, d);
+async fn process_http_file(
+    client: &reqwest::Client,
+    mode: Mode,
+    store_dir: &Path,
+    source_id: &str,
+    dataset_id: &str,
+    url: &str,
+    retries: u32,
+) -> Result<()> {
+    let d = Dataset {
+        source_id: source_id.to_string(),
+        source_name: source_id.to_string(),
+        dataset_id: dataset_id.to_string(),
+        dataset_name: dataset_id.to_string(),
+        kind: "http_file".to_string(),
+        url: url.to_string(),
+        crawl_download: false,
+        crawl_max_links: 0,
+        crawl_same_host_only: false,
+    };
+
+    let mp = manifest_path(store_dir, &d);
     let mut m = load_manifest(&mp)?;
     let now = now_iso()?;
-
-    if d.kind == "http_page" {
-        m.source_id = Some(d.source_id.clone());
-        m.dataset_id = Some(d.dataset_id.clone());
-        m.kind = Some(d.kind.clone());
-        m.url = Some(d.url.clone());
-        m.last_seen_at = Some(now);
-        write_manifest(&mp, &m)?;
-        info!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, "skip page dataset");
-        return Ok(());
-    }
-
-    if d.kind != "http_file" {
-        return Err(anyhow!("unknown dataset type {} for {}/{}", d.kind, d.source_id, d.dataset_id));
-    }
 
     let head = client
         .head(&d.url)
@@ -350,63 +424,100 @@ async fn process_dataset(client: &reqwest::Client, mode: Mode, store_dir: &Path,
 
     let mut headers = HeaderMap::new();
     if mode == Mode::UpdateIfNewer {
-        if let Some(ref e) = etag {
+        if let Some(ref e) = m.etag {
             if let Ok(v) = HeaderValue::from_str(e) {
                 headers.insert(reqwest::header::IF_NONE_MATCH, v);
             }
         }
-        if let Some(ref lm) = last_modified {
+        if let Some(ref lm) = m.last_modified {
             if let Ok(v) = HeaderValue::from_str(lm) {
                 headers.insert(reqwest::header::IF_MODIFIED_SINCE, v);
             }
         }
     }
 
-    let resp = client
-        .get(&d.url)
-        .headers(headers)
-        .send()
-        .await
-        .with_context(|| format!("get {}", d.url))?;
-    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-        info!(source_id = %d.source_id, dataset_id = %d.dataset_id, "304 not modified");
-        return Ok(());
-    }
-    if !resp.status().is_success() {
-        return Err(anyhow!(
-            "download not success for {}/{} (status {})",
-            d.source_id,
-            d.dataset_id,
-            resp.status()
-        ));
-    }
-
-    let ldir = latest_dir(store_dir, d);
+    let ldir = latest_dir(store_dir, &d);
     tokio::fs::create_dir_all(&ldir)
         .await
         .with_context(|| format!("mkdir {}", ldir.display()))?;
 
-    let fname = suggest_filename(&d.url, resp.headers());
-    let out = ldir.join(fname);
-    debug!(path = %out.display(), "writing download");
-    let mut file = tokio::fs::File::create(&out)
+    let mut attempt: u32 = 0;
+    let mut bytes_written: u64;
+    let mut out: Option<PathBuf> = None;
+    loop {
+        attempt += 1;
+        bytes_written = 0;
+
+        let resp = client
+            .get(&d.url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .with_context(|| format!("get {}", d.url))?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            info!(source_id = %d.source_id, dataset_id = %d.dataset_id, "304 not modified");
+            return Ok(());
+        }
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "download not success for {}/{} (status {})",
+                d.source_id,
+                d.dataset_id,
+                resp.status()
+            ));
+        }
+
+        let fname = suggest_filename(&d.url, resp.headers());
+        let path = ldir.join(fname);
+        let tmp = path.with_extension("part");
+        debug!(path = %path.display(), attempt, "writing download");
+
+        match (async {
+            let mut written: u64 = 0;
+            let mut file = tokio::fs::File::create(&tmp)
+                .await
+                .with_context(|| format!("create {}", tmp.display()))?;
+
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.context("read http body chunk")?;
+                file.write_all(&chunk).await.context("write chunk")?;
+                written += chunk.len() as u64;
+            }
+            file.flush().await.ok();
+            tokio::fs::rename(&tmp, &path)
+                .await
+                .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+            Ok::<u64, anyhow::Error>(written)
+        })
         .await
-        .with_context(|| format!("create {}", out.display()))?;
-
-    let mut stream = resp.bytes_stream();
-    let mut bytes_written: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("read http body chunk")?;
-        file.write_all(&chunk).await.context("write chunk")?;
-        bytes_written += chunk.len() as u64;
+        {
+            Ok(written) => {
+                bytes_written = written;
+                out = Some(path);
+                break;
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                let is_timeout = e
+                    .downcast_ref::<reqwest::Error>()
+                    .map(|re| re.is_timeout())
+                    .unwrap_or(false);
+                if is_timeout && attempt < retries.max(1) {
+                    warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, attempt, error = ?e, "download timed out; retrying");
+                    continue;
+                }
+                return Err(e);
+            }
+        }
     }
-    file.flush().await.ok();
 
+    let out = out.ok_or_else(|| anyhow!("missing output path"))?;
     let sha = sha256_file(&out).await?;
     if let Some(prev) = m.sha256.as_deref() {
         if prev != sha {
             let stamp = stamp_utc()?;
-            let hdir = history_dir(store_dir, d, &stamp);
+            let hdir = history_dir(store_dir, &d, &stamp);
             tokio::fs::create_dir_all(&hdir)
                 .await
                 .with_context(|| format!("mkdir {}", hdir.display()))?;
@@ -439,6 +550,57 @@ async fn process_dataset(client: &reqwest::Client, mode: Mode, store_dir: &Path,
     Ok(())
 }
 
+async fn process_dataset(
+    client: &reqwest::Client,
+    mode: Mode,
+    store_dir: &Path,
+    d: &Dataset,
+    retries: u32,
+) -> Result<()> {
+    if d.kind == "http_page" {
+        let mp = manifest_path(store_dir, d);
+        let mut m = load_manifest(&mp)?;
+        let now = now_iso()?;
+
+        m.source_id = Some(d.source_id.clone());
+        m.dataset_id = Some(d.dataset_id.clone());
+        m.kind = Some(d.kind.clone());
+        m.url = Some(d.url.clone());
+        m.last_seen_at = Some(now);
+        write_manifest(&mp, &m)?;
+        info!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, crawl_download = d.crawl_download, "page dataset");
+
+        if matches!(mode, Mode::Check) || !d.crawl_download {
+            return Ok(());
+        }
+
+        let links = crawl_links(client, &d.url, d.crawl_max_links, d.crawl_same_host_only).await?;
+        info!(source_id = %d.source_id, dataset_id = %d.dataset_id, links = links.len(), "discovered links");
+        let mut any_failed = false;
+        for link in links {
+            let mut h = Sha256::new();
+            h.update(link.as_bytes());
+            let url_hash = hex::encode(h.finalize());
+            let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
+            if let Err(e) =
+                process_http_file(client, mode, store_dir, &d.source_id, &key_dataset_id, &link, retries).await
+            {
+                any_failed = true;
+                error!(source_id = %d.source_id, dataset_id = %d.dataset_id, link = %link, error = ?e, "link failed");
+            }
+        }
+        if any_failed {
+            return Err(anyhow!("one or more crawled links failed"));
+        }
+        return Ok(());
+    }
+
+    if d.kind != "http_file" {
+        return Err(anyhow!("unknown dataset type {} for {}/{}", d.kind, d.source_id, d.dataset_id));
+    }
+    process_http_file(client, mode, store_dir, &d.source_id, &d.dataset_id, &d.url, retries).await
+}
+
 async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
     let (cfg, sources_cfg) = load_config()?;
     fs::create_dir_all(&cfg.store_dir).with_context(|| format!("mkdir {}", cfg.store_dir.display()))?;
@@ -456,6 +618,8 @@ async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
         .build()
         .context("build http client")?;
 
+    let retries = cfg.http_retries.unwrap_or(3);
+
     let concurrency = cfg.download_concurrency.unwrap_or(1).max(1);
     info!(concurrency, mode = ?mode, "starting run");
 
@@ -467,7 +631,12 @@ async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
     let tasks = futures_util::stream::iter(datasets.into_iter().map(|d| {
         let client = client.clone();
         let store_dir = cfg.store_dir.clone();
-        async move { process_dataset(&client, mode, &store_dir, &d).await }
+        let key = format!("{}/{}", d.source_id, d.dataset_id);
+        async move {
+            process_dataset(&client, mode, &store_dir, &d, retries)
+                .await
+                .with_context(|| format!("process {key}"))
+        }
     }))
     .buffer_unordered(concurrency);
 
@@ -478,7 +647,7 @@ async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
             Ok(()) => {}
             Err(e) => {
                 any_failed = true;
-                error!(error = %e, "dataset failed");
+                error!(error = ?e, "dataset failed");
             }
         }
     }

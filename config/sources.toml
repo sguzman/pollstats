@@ -8,6 +8,9 @@ homepage = "https://electionlab.mit.edu/"
   name = "MEDSL datasets landing page"
   type = "http_page"
   url = "https://electionlab.mit.edu/data"
+  crawl_download = true
+  crawl_max_links = 200
+  crawl_same_host_only = false
 
 [[sources]]
 id = "fec"
@@ -19,6 +22,9 @@ homepage = "https://www.fec.gov/"
   name = "FEC bulk data landing page"
   type = "http_page"
   url = "https://www.fec.gov/data/browse-data/?tab=bulk-data"
+  crawl_download = true
+  crawl_max_links = 200
+  crawl_same_host_only = false
 
 [[sources]]
 id = "census"
@@ -29,13 +35,19 @@ homepage = "https://www.census.gov/"
   id = "cps-voting-registration"
   name = "CPS Voting and Registration tables (landing)"
   type = "http_page"
-  url = "https://www.census.gov/topics/public-sector/voting/data.html"
+  url = "https://www.census.gov/topics/public-sector/voting.html"
+  crawl_download = true
+  crawl_max_links = 200
+  crawl_same_host_only = false
 
   [[sources.datasets]]
   id = "cvap"
   name = "Citizen Voting Age Population (CVAP) (landing)"
   type = "http_page"
-  url = "https://www.census.gov/programs-surveys/cvap.html"
+  url = "https://www.census.gov/programs-surveys/decennial-census/about/voting-rights/cvap.html"
+  crawl_download = true
+  crawl_max_links = 200
+  crawl_same_host_only = false
 
 [[sources]]
 id = "us-elections-project"
@@ -47,6 +59,9 @@ homepage = "https://www.electproject.org/"
   name = "Turnout and VEP/VAP series (landing)"
   type = "http_page"
   url = "https://www.electproject.org/national-1789-present"
+  crawl_download = true
+  crawl_max_links = 200
+  crawl_same_host_only = false
 
 [[sources]]
 id = "openelections"
@@ -58,6 +73,7 @@ homepage = "https://openelections.net/"
   name = "GitHub organization (landing)"
   type = "http_page"
   url = "https://github.com/openelections"
+  crawl_download = false
 
 [[sources]]
 id = "anes"
@@ -69,6 +85,7 @@ homepage = "https://electionstudies.org/"
   name = "ANES Data Center (landing)"
   type = "http_page"
   url = "https://electionstudies.org/data-center/"
+  crawl_download = false
 
 [[sources]]
 id = "ces"
@@ -80,6 +97,7 @@ homepage = "https://cces.gov.harvard.edu/"
   name = "CES data (landing)"
   type = "http_page"
   url = "https://cces.gov.harvard.edu/data"
+  crawl_download = false
 
 [[sources]]
 id = "alged"
@@ -91,4 +109,7 @@ homepage = "https://www.localgovtelections.org/"
   name = "ALGED data (landing)"
   type = "http_page"
   url = "https://www.localgovtelections.org/data"
-
+  # DNS lookup fails in this environment; re-enable when resolvable.
+  crawl_download = false
+  crawl_max_links = 200
+  crawl_same_host_only = false
