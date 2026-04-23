@@ -92,6 +92,14 @@ homepage = "https://electionstudies.org/"
   url = "https://electionstudies.org/data-center/"
   crawl_download = false
 
+  [[sources.datasets]]
+  id = "time-series-cdf-csv-20260205"
+  name = "ANES Time Series Cumulative Data File (CSV) (2026-02-05)"
+  type = "http_file"
+  url = "https://electionstudies.org/wp-content/uploads/2026/02/anes_timeseries_cdf_csv_20260205.zip"
+  # Cloudflare-protected; requires cookies. Store a Netscape cookiejar file here.
+  cookie_file = "cookies/anes-cookies.txt"
+
 [[sources]]
 id = "ces"
 name = "Cooperative Election Study (CES/CCES)"

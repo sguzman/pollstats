@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -65,6 +66,8 @@ struct DatasetConfig {
     crawl_same_host_only: Option<bool>,
     crawl_strategy: Option<String>,
     dataverse_subtrees: Option<Vec<String>>,
+    headers: Option<BTreeMap<String, String>>,
+    cookie_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +84,8 @@ struct Dataset {
     crawl_same_host_only: bool,
     crawl_strategy: CrawlStrategy,
     dataverse_subtrees: Vec<String>,
+    headers: BTreeMap<String, String>,
+    requires_cookie: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,10 +211,85 @@ fn iter_datasets(sources_cfg: &SourcesConfig) -> Vec<Dataset> {
                 crawl_same_host_only: d.crawl_same_host_only.unwrap_or(true),
                 crawl_strategy: CrawlStrategy::from_opt(d.crawl_strategy.as_deref()),
                 dataverse_subtrees: d.dataverse_subtrees.clone().unwrap_or_default(),
+                headers: resolve_dataset_headers(d.headers.clone().unwrap_or_default(), d.cookie_file.as_deref()),
+                requires_cookie: d.cookie_file.is_some(),
             });
         }
     }
     out
+}
+
+fn resolve_dataset_headers(mut headers: BTreeMap<String, String>, cookie_file: Option<&str>) -> BTreeMap<String, String> {
+    if let Some(path) = cookie_file {
+        match read_cookiejar_for_domain(Path::new(path), "electionstudies.org") {
+            Ok(cookie_header) => {
+                if !cookie_header.trim().is_empty() {
+                    headers.insert("Cookie".to_string(), cookie_header);
+                } else {
+                    debug!(path, "cookie file had no usable cookies for electionstudies.org");
+                }
+            }
+            Err(e) => {
+                debug!(path, error = ?e, "failed to read cookie file");
+            }
+        }
+    }
+    headers
+}
+
+fn read_cookiejar_for_domain(path: &Path, domain: &str) -> Result<String> {
+    let txt = fs::read_to_string(path).with_context(|| format!("read cookie file {}", path.display()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let mut parts: Vec<String> = Vec::new();
+    for line in txt.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Netscape cookie file format:
+        // domain \t flag \t path \t secure \t expiration \t name \t value
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        let mut c_domain = cols[0].trim();
+        if c_domain.starts_with("#HttpOnly_") {
+            c_domain = c_domain.trim_start_matches("#HttpOnly_");
+        }
+        let exp: i64 = cols[4].trim().parse().unwrap_or(0);
+        let name = cols[5].trim();
+        let value = cols[6].trim();
+
+        if name.is_empty() {
+            continue;
+        }
+        if exp != 0 && exp < now {
+            continue;
+        }
+        // match exact domain or suffix (.example.org)
+        let want = domain.trim_start_matches('.');
+        let cd = c_domain.trim_start_matches('.');
+        if cd != want && !cd.ends_with(want) && !want.ends_with(cd) {
+            continue;
+        }
+        parts.push(format!("{name}={value}"));
+    }
+    Ok(parts.join("; "))
+}
+
+fn to_headermap(headers: &BTreeMap<String, String>) -> Result<HeaderMap> {
+    let mut out = HeaderMap::new();
+    for (k, v) in headers {
+        let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+            .with_context(|| format!("invalid header name {k}"))?;
+        let value = HeaderValue::from_str(v).with_context(|| format!("invalid header value for {k}"))?;
+        out.insert(name, value);
+    }
+    Ok(out)
 }
 
 fn manifest_path(store_dir: &Path, d: &Dataset) -> PathBuf {
@@ -679,6 +759,7 @@ async fn process_http_file(
     url: &str,
     retries: u32,
     rate_limit_bps: u64,
+    extra_headers: &BTreeMap<String, String>,
 ) -> Result<()> {
     let d = Dataset {
         source_id: source_id.to_string(),
@@ -692,6 +773,8 @@ async fn process_http_file(
         crawl_same_host_only: false,
         crawl_strategy: CrawlStrategy::ExtensionsOnly,
         dataverse_subtrees: Vec::new(),
+        headers: extra_headers.clone(),
+        requires_cookie: false,
     };
 
     let mp = manifest_path(store_dir, &d);
@@ -705,7 +788,8 @@ async fn process_http_file(
 
     // Some hosts (notably Dataverse access endpoints) return 403 to HEAD. Treat that as "unknown",
     // and fall back to downloading (GET), which may still succeed.
-    match client.head(&d.url).send().await {
+    let extra = to_headermap(&d.headers)?;
+    match client.head(&d.url).headers(extra.clone()).send().await {
         Ok(head) => {
             let status = head.status();
             if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
@@ -775,6 +859,10 @@ async fn process_http_file(
             }
         }
     }
+    // Merge in extra headers (e.g. Cookie) last so they win.
+    for (k, v) in extra.iter() {
+        headers.insert(k, v.clone());
+    }
 
     let ldir = latest_dir(store_dir, &d);
     tokio::fs::create_dir_all(&ldir)
@@ -789,12 +877,17 @@ async fn process_http_file(
     loop {
         attempt += 1;
 
-    let resp = client
-        .get(&d.url)
-        .headers(headers.clone())
-        .send()
-        .await
-        .with_context(|| format!("get {}", d.url))?;
+        let resp = client
+            .get(&d.url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .with_context(|| format!("get {}", d.url))?;
+        if d.source_id == "anes" && resp.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(anyhow!(
+                "ANES cookie invalid/expired (got 403). Refusing to attempt electionstudies.org further."
+            ));
+        }
         if resp.content_length().is_none() {
             // Some hosts stream without length; allow, but log because timeouts are more likely.
             debug!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, "no content-length");
@@ -956,18 +1049,19 @@ async fn process_dataset(
                     h.update(it.url.as_bytes());
                     let url_hash = hex::encode(h.finalize());
                     let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
-                    if let Err(e) = process_http_file(
-                        client,
-                        mode,
-                        store_dir,
-                        &d.source_id,
-                        &key_dataset_id,
-                        &it.url,
-                        retries,
-                        rate_limit_bps,
-                    )
-                    .await
-                    {
+                            if let Err(e) = process_http_file(
+                                client,
+                                mode,
+                                store_dir,
+                                &d.source_id,
+                                &key_dataset_id,
+                                &it.url,
+                                retries,
+                                rate_limit_bps,
+                                &BTreeMap::new(),
+                            )
+                            .await
+                            {
                         any_failed = true;
                         error!(
                             source_id = %d.source_id,
@@ -1022,7 +1116,7 @@ async fn process_dataset(
                     let url_hash = hex::encode(h.finalize());
                     let key_dataset_id = format!("{}-{}", d.dataset_id, &url_hash[..16]);
                     if let Err(e) =
-                        process_http_file(client, mode, store_dir, &d.source_id, &key_dataset_id, &link, retries, rate_limit_bps).await
+                        process_http_file(client, mode, store_dir, &d.source_id, &key_dataset_id, &link, retries, rate_limit_bps, &BTreeMap::new()).await
                     {
                         any_failed = true;
                         error!(source_id = %d.source_id, dataset_id = %d.dataset_id, link = %link, error = ?e, "link failed");
@@ -1040,6 +1134,13 @@ async fn process_dataset(
     if d.kind != "http_file" {
         return Err(anyhow!("unknown dataset type {} for {}/{}", d.kind, d.source_id, d.dataset_id));
     }
+    if d.requires_cookie && !d.headers.contains_key("Cookie") {
+        return Err(anyhow!(
+            "cookie required but missing/invalid for {}/{}; refusing to attempt this domain",
+            d.source_id,
+            d.dataset_id
+        ));
+    }
     process_http_file(
         client,
         mode,
@@ -1049,6 +1150,7 @@ async fn process_dataset(
         &d.url,
         retries,
         rate_limit_bps,
+        &d.headers,
     )
     .await
 }

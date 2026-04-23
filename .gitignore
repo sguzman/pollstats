@@ -1,6 +1,9 @@
 # Local downloaded store (kept out of git)
 .cache/pollstats/
 
+# Cookies / auth material (keep out of git)
+cookies/
+
 # Rust
 target/
 
