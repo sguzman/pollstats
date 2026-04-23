@@ -1015,6 +1015,58 @@ fn sanitize_aria_filename(name: &str) -> String {
     }
 }
 
+fn lexical_relative(from: &Path, to: &Path) -> PathBuf {
+    // Build a purely lexical relative path (no filesystem access).
+    // This is good enough for our use case because we control the emitted paths.
+    if from.is_absolute() != to.is_absolute() {
+        return to.to_path_buf();
+    }
+
+    let mut from_parts: Vec<std::path::Component<'_>> = from
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    let mut to_parts: Vec<std::path::Component<'_>> = to
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+
+    // Drop common prefix.
+    while !from_parts.is_empty() && !to_parts.is_empty() && from_parts[0] == to_parts[0] {
+        from_parts.remove(0);
+        to_parts.remove(0);
+    }
+    if from.is_absolute() && !to.is_absolute() {
+        // unreachable due to guard above, but keep this obviously correct.
+        return to.to_path_buf();
+    }
+    if from.is_absolute() && matches!(to_parts.first(), Some(std::path::Component::RootDir)) {
+        // Different roots/drives; relative path doesn't make sense.
+        return to.to_path_buf();
+    }
+
+    let mut out = PathBuf::new();
+    for _ in 0..from_parts.len() {
+        out.push("..");
+    }
+    for p in to_parts {
+        match p {
+            std::path::Component::Normal(s) => out.push(s),
+            std::path::Component::ParentDir => out.push(".."),
+            std::path::Component::CurDir => {}
+            _ => {
+                // Prefix / RootDir. If we get here, just fall back to absolute `to`.
+                return to.to_path_buf();
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
 fn write_aria_conf(cfg: &AppConfig, conf_path: &Path, urls_path: &Path) -> Result<()> {
     if let Some(parent) = conf_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -1064,6 +1116,14 @@ fn write_aria_urls(
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
 
+    // We expect aria2 to be run from the directory containing the generated `urls` file
+    // (typically `.cache/pollstats/aria`). Emit `dir=` relative to that working directory
+    // so downloads land in the exact same `store_dir/raw/.../latest` locations as the
+    // built-in downloader.
+    let aria_workdir = urls_path
+        .parent()
+        .ok_or_else(|| anyhow!("urls_path has no parent"))?;
+
     let store_dir = &cfg.store_dir;
     let mut out = String::new();
 
@@ -1088,7 +1148,9 @@ fn write_aria_urls(
         for it in cache.items {
             out.push_str(&it.url);
             out.push('\n');
-            out.push_str(&format!("  dir={}\n", it.dir));
+            let dir_absish = PathBuf::from(&it.dir);
+            let dir_rel = lexical_relative(aria_workdir, &dir_absish);
+            out.push_str(&format!("  dir={}\n", dir_rel.to_string_lossy()));
             out.push_str(&format!("  out={}\n", it.out));
 
             // Headers from enumeration (non-secret).
