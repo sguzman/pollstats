@@ -18,9 +18,20 @@ use tracing_subscriber::EnvFilter;
 struct AppConfig {
     store_dir: PathBuf,
     sources_file: PathBuf,
-    postgres_url: Option<String>,
+    postgres: Option<PostgresConfig>,
     http_timeout_seconds: Option<u64>,
     user_agent: Option<String>,
+    download_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PostgresConfig {
+    user: String,
+    pass: String,
+    host: String,
+    port: u16,
+    db: String,
+    sslmode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -264,6 +275,168 @@ fn is_selected(only: &[String], d: &Dataset) -> bool {
     only.iter().any(|x| x == &key)
 }
 
+async fn process_dataset(client: &reqwest::Client, mode: Mode, store_dir: &Path, d: &Dataset) -> Result<()> {
+    let mp = manifest_path(store_dir, d);
+    let mut m = load_manifest(&mp)?;
+    let now = now_iso()?;
+
+    if d.kind == "http_page" {
+        m.source_id = Some(d.source_id.clone());
+        m.dataset_id = Some(d.dataset_id.clone());
+        m.kind = Some(d.kind.clone());
+        m.url = Some(d.url.clone());
+        m.last_seen_at = Some(now);
+        write_manifest(&mp, &m)?;
+        info!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, "skip page dataset");
+        return Ok(());
+    }
+
+    if d.kind != "http_file" {
+        return Err(anyhow!("unknown dataset type {} for {}/{}", d.kind, d.source_id, d.dataset_id));
+    }
+
+    let head = client
+        .head(&d.url)
+        .send()
+        .await
+        .with_context(|| format!("head {}", d.url))?;
+    let status = head.status();
+    if !status.is_success() {
+        warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, http_status = %status, "head not success");
+    }
+
+    let etag = head
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let last_modified = head
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_length = head
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let remote_newer = match (&m.etag, &etag, &m.last_modified, &last_modified) {
+        (Some(a), Some(b), _, _) if a == b => false,
+        (_, _, Some(a), Some(b)) if a == b => false,
+        _ => true,
+    };
+
+    match mode {
+        Mode::Check => {
+            info!(
+                source_id = %d.source_id,
+                dataset_id = %d.dataset_id,
+                newer = remote_newer,
+                etag = etag.as_deref().unwrap_or(""),
+                last_modified = last_modified.as_deref().unwrap_or(""),
+                "checked"
+            );
+            return Ok(());
+        }
+        Mode::UpdateIfNewer if !remote_newer => {
+            info!(source_id = %d.source_id, dataset_id = %d.dataset_id, "unchanged; skip download");
+            return Ok(());
+        }
+        Mode::UpdateIfNewer | Mode::DownloadAlways => {}
+    }
+
+    let mut headers = HeaderMap::new();
+    if mode == Mode::UpdateIfNewer {
+        if let Some(ref e) = etag {
+            if let Ok(v) = HeaderValue::from_str(e) {
+                headers.insert(reqwest::header::IF_NONE_MATCH, v);
+            }
+        }
+        if let Some(ref lm) = last_modified {
+            if let Ok(v) = HeaderValue::from_str(lm) {
+                headers.insert(reqwest::header::IF_MODIFIED_SINCE, v);
+            }
+        }
+    }
+
+    let resp = client
+        .get(&d.url)
+        .headers(headers)
+        .send()
+        .await
+        .with_context(|| format!("get {}", d.url))?;
+    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+        info!(source_id = %d.source_id, dataset_id = %d.dataset_id, "304 not modified");
+        return Ok(());
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "download not success for {}/{} (status {})",
+            d.source_id,
+            d.dataset_id,
+            resp.status()
+        ));
+    }
+
+    let ldir = latest_dir(store_dir, d);
+    tokio::fs::create_dir_all(&ldir)
+        .await
+        .with_context(|| format!("mkdir {}", ldir.display()))?;
+
+    let fname = suggest_filename(&d.url, resp.headers());
+    let out = ldir.join(fname);
+    debug!(path = %out.display(), "writing download");
+    let mut file = tokio::fs::File::create(&out)
+        .await
+        .with_context(|| format!("create {}", out.display()))?;
+
+    let mut stream = resp.bytes_stream();
+    let mut bytes_written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read http body chunk")?;
+        file.write_all(&chunk).await.context("write chunk")?;
+        bytes_written += chunk.len() as u64;
+    }
+    file.flush().await.ok();
+
+    let sha = sha256_file(&out).await?;
+    if let Some(prev) = m.sha256.as_deref() {
+        if prev != sha {
+            let stamp = stamp_utc()?;
+            let hdir = history_dir(store_dir, d, &stamp);
+            tokio::fs::create_dir_all(&hdir)
+                .await
+                .with_context(|| format!("mkdir {}", hdir.display()))?;
+            let hout = hdir.join("download.bin");
+            tokio::fs::copy(&out, &hout)
+                .await
+                .with_context(|| format!("copy {} -> {}", out.display(), hout.display()))?;
+        }
+    }
+
+    m.source_id = Some(d.source_id.clone());
+    m.dataset_id = Some(d.dataset_id.clone());
+    m.kind = Some(d.kind.clone());
+    m.url = Some(d.url.clone());
+    m.fetched_at = Some(now);
+    m.etag = etag;
+    m.last_modified = last_modified;
+    m.content_length = content_length;
+    m.sha256 = Some(sha);
+    m.local_path = Some(out.to_string_lossy().to_string());
+    write_manifest(&mp, &m)?;
+
+    info!(
+        source_id = %d.source_id,
+        dataset_id = %d.dataset_id,
+        bytes = bytes_written,
+        path = %m.local_path.as_deref().unwrap_or(""),
+        "downloaded"
+    );
+    Ok(())
+}
+
 async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
     let (cfg, sources_cfg) = load_config()?;
     fs::create_dir_all(&cfg.store_dir).with_context(|| format!("mkdir {}", cfg.store_dir.display()))?;
@@ -281,180 +454,31 @@ async fn run_http(mode: Mode, only: Vec<String>) -> Result<i32> {
         .build()
         .context("build http client")?;
 
+    let concurrency = cfg.download_concurrency.unwrap_or(1).max(1);
+    info!(concurrency, mode = ?mode, "starting run");
+
+    let datasets: Vec<Dataset> = iter_datasets(&sources_cfg)
+        .into_iter()
+        .filter(|d| is_selected(&only, d))
+        .collect();
+
+    let tasks = futures_util::stream::iter(datasets.into_iter().map(|d| {
+        let client = client.clone();
+        let store_dir = cfg.store_dir.clone();
+        async move { process_dataset(&client, mode, &store_dir, &d).await }
+    }))
+    .buffer_unordered(concurrency);
+
     let mut any_failed = false;
-    for d in iter_datasets(&sources_cfg) {
-        if !is_selected(&only, &d) {
-            continue;
-        }
-
-        let mp = manifest_path(&cfg.store_dir, &d);
-        let mut m = load_manifest(&mp)?;
-        let now = now_iso()?;
-
-        if d.kind == "http_page" {
-            m.source_id = Some(d.source_id.clone());
-            m.dataset_id = Some(d.dataset_id.clone());
-            m.kind = Some(d.kind.clone());
-            m.url = Some(d.url.clone());
-            m.last_seen_at = Some(now);
-            write_manifest(&mp, &m)?;
-            info!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, "skip page dataset");
-            continue;
-        }
-
-        if d.kind != "http_file" {
-            warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, kind = %d.kind, "unknown dataset type");
-            any_failed = true;
-            continue;
-        }
-
-        let head = match client.head(&d.url).send().await {
-            Ok(r) => r,
+    futures_util::pin_mut!(tasks);
+    while let Some(res) = tasks.next().await {
+        match res {
+            Ok(()) => {}
             Err(e) => {
-                error!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, error = %e, "head failed");
                 any_failed = true;
-                continue;
-            }
-        };
-        let status = head.status();
-        if !status.is_success() {
-            warn!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, http_status = %status, "head not success");
-        }
-
-        let etag = head
-            .headers()
-            .get(reqwest::header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let last_modified = head
-            .headers()
-            .get(reqwest::header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let content_length = head
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let remote_newer = match (&m.etag, &etag, &m.last_modified, &last_modified) {
-            (Some(a), Some(b), _, _) if a == b => false,
-            (_, _, Some(a), Some(b)) if a == b => false,
-            _ => true,
-        };
-
-        match mode {
-            Mode::Check => {
-                info!(
-                    source_id = %d.source_id,
-                    dataset_id = %d.dataset_id,
-                    newer = remote_newer,
-                    etag = etag.as_deref().unwrap_or(""),
-                    last_modified = last_modified.as_deref().unwrap_or(""),
-                    "checked"
-                );
-                continue;
-            }
-            Mode::UpdateIfNewer if !remote_newer => {
-                info!(source_id = %d.source_id, dataset_id = %d.dataset_id, "unchanged; skip download");
-                continue;
-            }
-            Mode::UpdateIfNewer | Mode::DownloadAlways => {}
-        }
-
-        let mut headers = HeaderMap::new();
-        if mode == Mode::UpdateIfNewer {
-            if let Some(ref e) = etag {
-                if let Ok(v) = HeaderValue::from_str(e) {
-                    headers.insert(reqwest::header::IF_NONE_MATCH, v);
-                }
-            }
-            if let Some(ref lm) = last_modified {
-                if let Ok(v) = HeaderValue::from_str(lm) {
-                    headers.insert(reqwest::header::IF_MODIFIED_SINCE, v);
-                }
+                error!(error = %e, "dataset failed");
             }
         }
-
-        let resp = match client.get(&d.url).headers(headers).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                error!(source_id = %d.source_id, dataset_id = %d.dataset_id, url = %d.url, error = %e, "download failed");
-                any_failed = true;
-                continue;
-            }
-        };
-        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            info!(source_id = %d.source_id, dataset_id = %d.dataset_id, "304 not modified");
-            continue;
-        }
-        if !resp.status().is_success() {
-            error!(
-                source_id = %d.source_id,
-                dataset_id = %d.dataset_id,
-                url = %d.url,
-                http_status = %resp.status(),
-                "download not success"
-            );
-            any_failed = true;
-            continue;
-        }
-
-        let ldir = latest_dir(&cfg.store_dir, &d);
-        tokio::fs::create_dir_all(&ldir)
-            .await
-            .with_context(|| format!("mkdir {}", ldir.display()))?;
-
-        let fname = suggest_filename(&d.url, resp.headers());
-        let out = ldir.join(fname);
-        debug!(path = %out.display(), "writing download");
-        let mut file = tokio::fs::File::create(&out)
-            .await
-            .with_context(|| format!("create {}", out.display()))?;
-
-        let mut stream = resp.bytes_stream();
-        let mut bytes_written: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read http body chunk")?;
-            file.write_all(&chunk).await.context("write chunk")?;
-            bytes_written += chunk.len() as u64;
-        }
-        file.flush().await.ok();
-
-        let sha = sha256_file(&out).await?;
-        if let Some(prev) = m.sha256.as_deref() {
-            if prev != sha {
-                let stamp = stamp_utc()?;
-                let hdir = history_dir(&cfg.store_dir, &d, &stamp);
-                tokio::fs::create_dir_all(&hdir)
-                    .await
-                    .with_context(|| format!("mkdir {}", hdir.display()))?;
-                let hout = hdir.join("download.bin");
-                tokio::fs::copy(&out, &hout)
-                    .await
-                    .with_context(|| format!("copy {} -> {}", out.display(), hout.display()))?;
-            }
-        }
-
-        m.source_id = Some(d.source_id.clone());
-        m.dataset_id = Some(d.dataset_id.clone());
-        m.kind = Some(d.kind.clone());
-        m.url = Some(d.url.clone());
-        m.fetched_at = Some(now);
-        m.etag = etag;
-        m.last_modified = last_modified;
-        m.content_length = content_length;
-        m.sha256 = Some(sha);
-        m.local_path = Some(out.to_string_lossy().to_string());
-        write_manifest(&mp, &m)?;
-
-        info!(
-            source_id = %d.source_id,
-            dataset_id = %d.dataset_id,
-            bytes = bytes_written,
-            path = %m.local_path.as_deref().unwrap_or(""),
-            "downloaded"
-        );
     }
 
     Ok(if any_failed { 1 } else { 0 })
@@ -466,10 +490,21 @@ async fn pg_url(cfg: &AppConfig) -> Result<String> {
             return Ok(v);
         }
     }
-    cfg.postgres_url
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow!("missing postgres_url in config/pollstats.toml (or POLLSTATS_PG_URL)"))
+    let Some(pg) = cfg.postgres.clone() else {
+        return Err(anyhow!(
+            "missing [postgres] config in config/pollstats.toml (or POLLSTATS_PG_URL)"
+        ));
+    };
+    let sslmode = pg.sslmode.unwrap_or_else(|| "disable".to_string());
+    Ok(format!(
+        "postgresql://{}:{}@{}:{}/{}?sslmode={}",
+        urlencoding::encode(&pg.user),
+        urlencoding::encode(&pg.pass),
+        pg.host,
+        pg.port,
+        pg.db,
+        sslmode
+    ))
 }
 
 async fn cmd_pg_init() -> Result<i32> {

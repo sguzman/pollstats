@@ -35,6 +35,6 @@ Override:
 
 ## Data layout
 
-- `data_store/raw/<source_id>/<dataset_id>/latest/` latest fetched artifact(s)
-- `data_store/raw/<source_id>/<dataset_id>/history/<timestamp>/` older versions (when content SHA changes)
-- `data_store/manifests/<source_id>/<dataset_id>.json` tracks ETag/Last-Modified/SHA256
+- `.cache/pollstats/raw/<source_id>/<dataset_id>/latest/` latest fetched artifact(s)
+- `.cache/pollstats/raw/<source_id>/<dataset_id>/history/<timestamp>/` older versions (when content SHA changes)
+- `.cache/pollstats/manifests/<source_id>/<dataset_id>.json` tracks ETag/Last-Modified/SHA256

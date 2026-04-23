@@ -2,13 +2,21 @@
 # - POLLSTATS_CONFIG (path to this file)
 # - POLLSTATS_PG_URL (Postgres URL)
 
-store_dir = "data_store"
+store_dir = ".cache/pollstats"
 sources_file = "config/sources.toml"
 
-# Example: "postgresql://admin:admin@localhost:5432/data?sslmode=disable"
-postgres_url = "postgresql://admin:admin@localhost:5432/data?sslmode=disable"
+[postgres]
+user = "admin"
+pass = "admin"
+host = "localhost"
+port = 5432
+db = "data"
+sslmode = "disable"
 
 # HTTP
 http_timeout_seconds = 60
 user_agent = "pollstats/0.1 (+local)"
 
+# How aggressively to fetch datasets.
+# 1 = download each one at a time (default).
+download_concurrency = 1
